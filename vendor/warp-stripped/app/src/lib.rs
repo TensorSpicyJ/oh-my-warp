@@ -499,6 +499,18 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
     }
 }
 
+/// Start the embedded omw-server (v0.3 wiring 1). Called from binary entry points
+/// before the main app loop so the agent panel has a local backend to talk to.
+#[cfg(feature = "omw_local")]
+pub fn start_omw_server() {
+    omw::OmwServerState::ensure_running();
+}
+
+#[cfg(not(feature = "omw_local"))]
+pub fn start_omw_server() {
+    // No-op when omw_local isn't enabled.
+}
+
 /// Runs the app. If a subcommand was requested, it'll be run instead of the main application.
 pub fn run() -> Result<()> {
     // Perform any necessary platform-specific initialization.

@@ -5,6 +5,8 @@
 //!   `127.0.0.1` HTTP loopback (no auth — assumes in-process trust).
 //! - A [`SessionRegistry`] tracking live PTY sessions: register, list, look up
 //!   by id, write input, subscribe to output, kill on drop.
+//! - [`serve`] — bind+run the router on a given [`SocketAddr`], blocking until
+//!   the server exits.
 //!
 //! The registry is in-memory only; there is no persistence in v0.4-thin.
 //!
@@ -20,6 +22,8 @@ pub use registry::{
     ExternalSessionSpec, Session, SessionId, SessionMeta, SessionRegistry, SessionSpec,
 };
 
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::routing::{get, post};
@@ -36,6 +40,7 @@ use axum::Router;
 /// - `DELETE /sessions/:id`        — kill a session.
 pub fn router(registry: Arc<SessionRegistry>) -> Router {
     Router::new()
+        // Session registry routes (with state).
         .route(
             "/internal/v1/sessions",
             post(handlers::sessions::create).get(handlers::sessions::list),
@@ -52,5 +57,16 @@ pub fn router(registry: Arc<SessionRegistry>) -> Router {
             "/internal/v1/sessions/:id/pty",
             get(handlers::ws_pty::ws_handler),
         )
+        // Agent routes (no state needed).
+        .route("/api/v1/providers", get(handlers::agent::list_providers))
+        .route("/api/v1/agent/ask", post(handlers::agent::ask))
         .with_state(registry)
+}
+
+/// Bind `addr` and serve the [`router`] until the server exits or the listener
+/// fails. Blocks the calling task; intended to run on a dedicated runtime thread.
+pub async fn serve(registry: Arc<SessionRegistry>, bind: SocketAddr) -> io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let app = router(registry);
+    axum::serve(listener, app.into_make_service()).await
 }

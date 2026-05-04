@@ -1120,7 +1120,12 @@ impl View for AIAssistantPanelView {
         let appearance = Appearance::as_ref(app);
 
         if self.is_omw_placeholder {
-            const OMW_PLACEHOLDER_TEXT: &str = "AI is unavailable in this build. Configure providers via `omw provider add` in your terminal \u{2014} full omw integration is coming in v0.3.";
+            const OMW_PLACEHOLDER_TEXT: &str = "\
+omw-server is running on http://127.0.0.1:8788\n\n\
+Configure providers:\n  omw provider add <name> --kind openai --key <key>\n\
+List providers:\n  omw provider list\n  curl http://127.0.0.1:8788/api/v1/providers\n\
+Agent API:\n  curl -X POST http://127.0.0.1:8788/api/v1/agent/ask \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"provider\":\"<name>\",\"prompt\":\"hello\"}'\n\n\
+GUI agent panel coming in a follow-up release.";
             let theme = appearance.theme();
             return Align::new(
                 Container::new(

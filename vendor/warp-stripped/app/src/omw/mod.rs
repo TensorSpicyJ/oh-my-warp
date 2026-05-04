@@ -14,8 +14,10 @@ pub mod pane_auto_share;
 pub mod pane_share;
 pub mod qr;
 pub mod remote_state;
+pub mod server_state;
 pub mod tailscale;
 
 #[allow(unused_imports)]
 pub use pane_share::{share_pane, PaneShareHandle, ShareError};
 pub use remote_state::{OmwRemoteState, OmwRemoteStatus};
+pub use server_state::OmwServerState;

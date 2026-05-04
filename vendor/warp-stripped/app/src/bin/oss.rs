@@ -28,6 +28,9 @@ fn main() -> Result<()> {
     }
     ChannelState::set(state);
 
+    #[cfg(feature = "omw_local")]
+    warp::start_omw_server();
+
     warp::run()
 }
 

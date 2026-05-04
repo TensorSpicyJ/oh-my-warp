@@ -179,7 +179,21 @@ pub(crate) fn add(
     if let Some(b) = parsed_base_url.as_ref() {
         new_table["base_url"] = value(b.as_str());
     }
-    if let Some(model) = args.default_model.as_ref() {
+    let default_model = if let Some(ref m) = args.default_model {
+        Some(m.clone())
+    } else if args.non_interactive {
+        None
+    } else {
+        print!("Default model (press Enter to skip): ");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .ok()
+            .map(|_| input.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(ref model) = default_model {
         new_table["default_model"] = value(model.as_str());
     }
     new_table.set_implicit(false);
@@ -193,7 +207,7 @@ pub(crate) fn add(
         .and_then(|i| i.as_str())
         .is_some();
     let providers_count = providers_table(&doc).map(|t| t.len()).unwrap_or(0);
-    let auto_default = args.non_interactive && !had_default_provider && providers_count == 1;
+    let auto_default = !had_default_provider && providers_count == 1;
     if args.make_default || auto_default {
         doc["default_provider"] = value(pid.as_str());
     }
@@ -207,6 +221,14 @@ pub(crate) fn add(
         pid.as_str(),
         kind.as_kebab()
     )?;
+    if args.non_interactive && default_model.is_none() {
+        writeln!(
+            stdout,
+            "Hint: set a default model with `omw provider add {name} --default-model <model>` or by editing {cfg_path}",
+            name = pid.as_str(),
+            cfg_path = cfg_path.display(),
+        )?;
+    }
     Ok(())
 }
 

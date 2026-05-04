@@ -58,14 +58,14 @@ impl WarpServerConfig {
 
     /// Local/offline defaults for the omw fork.
     ///
-    /// These values intentionally avoid Warp-operated hosts. The default port `0` makes accidental
-    /// network use fail locally until an omw server is explicitly wired in via environment variables
-    /// or CLI URL overrides.
+    /// These values intentionally avoid Warp-operated hosts. The default points at the
+    /// embedded omw-server on `127.0.0.1:8788`. Set `OMW_SERVER_ROOT_URL` or
+    /// `OMW_RTC_SERVER_URL` to override.
     pub fn omw_local() -> Self {
         let server_root_url =
-            env::var("OMW_SERVER_ROOT_URL").unwrap_or_else(|_| "http://127.0.0.1:0".to_string());
+            env::var("OMW_SERVER_ROOT_URL").unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
         let rtc_server_url = env::var("OMW_RTC_SERVER_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:0/graphql/v2".to_string());
+            .unwrap_or_else(|_| "ws://127.0.0.1:8788/graphql/v2".to_string());
 
         Self {
             server_root_url: Cow::Owned(server_root_url),
@@ -104,10 +104,10 @@ impl OzConfig {
     /// Local/offline defaults for the omw fork.
     pub fn omw_local() -> Self {
         let oz_root_url =
-            env::var("OMW_OZ_ROOT_URL").unwrap_or_else(|_| "http://127.0.0.1:0".to_string());
+            env::var("OMW_OZ_ROOT_URL").unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
         let workload_audience_url = env::var("OMW_WORKLOAD_AUDIENCE_URL")
             .or_else(|_| env::var("OMW_SERVER_ROOT_URL"))
-            .unwrap_or_else(|_| "http://127.0.0.1:0".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
 
         Self {
             oz_root_url: Cow::Owned(oz_root_url),

@@ -17,13 +17,27 @@ fn init() {
     });
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 #[test]
-fn unset_backend_on_non_mac_defaults_to_memory() {
+fn unset_backend_on_linux_defaults_to_memory() {
     init();
     assert_eq!(
         omw_keychain::current_backend_kind(),
         omw_keychain::BackendKind::Memory
+    );
+    let kr = key_ref(&unique_name("default"));
+    omw_keychain::set(&kr, "x").unwrap();
+    assert_eq!(omw_keychain::get(&kr).unwrap().expose(), "x");
+    let _ = omw_keychain::delete(&kr);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn unset_backend_on_windows_defaults_to_os() {
+    init();
+    assert_eq!(
+        omw_keychain::current_backend_kind(),
+        omw_keychain::BackendKind::Os
     );
     let kr = key_ref(&unique_name("default"));
     omw_keychain::set(&kr, "x").unwrap();

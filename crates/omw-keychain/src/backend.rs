@@ -34,7 +34,7 @@ fn resolve() -> Resolved {
     match normalized {
         "memory" => Resolved::Memory,
         "os" => {
-            if cfg!(target_os = "macos") {
+            if cfg!(any(target_os = "macos", target_os = "windows")) {
                 Resolved::Os
             } else {
                 Resolved::OsUnavailable
@@ -42,7 +42,7 @@ fn resolve() -> Resolved {
         }
         // "auto" or unrecognized — fall through to platform default.
         _ => {
-            if cfg!(target_os = "macos") {
+            if cfg!(any(target_os = "macos", target_os = "windows")) {
                 Resolved::Os
             } else {
                 Resolved::Memory
@@ -100,7 +100,7 @@ pub(crate) fn list_omw() -> Result<Vec<String>, KeychainError> {
 
 fn backend_unavailable() -> KeychainError {
     KeychainError::BackendUnavailable {
-        reason: "OS keychain backend is unavailable on this platform (Linux/Windows are Beyond v1)"
+        reason: "OS keychain backend is unavailable on this platform (Linux is Beyond v1)"
             .into(),
     }
 }
@@ -218,7 +218,61 @@ mod os_impl {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod os_impl {
+    use super::{KeychainError, SERVICE};
+
+    pub(super) fn get(account: &str) -> Result<String, KeychainError> {
+        match keyring::Entry::new(SERVICE, account)
+            .map_err(box_os)?
+            .get_password()
+        {
+            Ok(pw) => Ok(pw),
+            Err(keyring::Error::NoEntry) => Err(KeychainError::NotFound),
+            Err(e) => Err(KeychainError::Os {
+                source: Box::new(e),
+            }),
+        }
+    }
+
+    pub(super) fn set(account: &str, value: &str) -> Result<(), KeychainError> {
+        keyring::Entry::new(SERVICE, account)
+            .map_err(box_os)?
+            .set_password(value)
+            .map_err(box_os)
+    }
+
+    pub(super) fn delete(account: &str) -> Result<(), KeychainError> {
+        match keyring::Entry::new(SERVICE, account)
+            .map_err(box_os)?
+            .delete_credential()
+        {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Err(KeychainError::NotFound),
+            Err(e) => Err(KeychainError::Os {
+                source: Box::new(e),
+            }),
+        }
+    }
+
+    pub(super) fn list_omw() -> Result<Vec<String>, KeychainError> {
+        // keyring v3's windows-native backend does not expose credential
+        // enumeration. Return an empty list rather than an error so callers
+        // can still display configured providers from the config file.
+        Ok(vec![])
+    }
+
+    fn box_os(e: keyring::Error) -> KeychainError {
+        match e {
+            keyring::Error::NoEntry => KeychainError::NotFound,
+            other => KeychainError::Os {
+                source: Box::new(other),
+            },
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 mod os_impl {
     use super::KeychainError;
 

@@ -3,6 +3,7 @@
 //! Each submodule corresponds to one route family. The router itself is
 //! assembled in [`crate::router`].
 
+pub mod agent;
 pub mod input;
 pub mod sessions;
 pub mod ws_pty;

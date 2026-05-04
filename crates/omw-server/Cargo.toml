@@ -9,6 +9,7 @@ publish.workspace = true
 description = "Local backend shim for the forked client; sole audit writer."
 
 [dependencies]
+omw-config = { path = "../omw-config" }
 omw-pty = { path = "../omw-pty" }
 axum = { version = "0.7", features = ["ws", "macros"] }
 tokio = { version = "1", features = [
@@ -18,6 +19,7 @@ tokio = { version = "1", features = [
     "io-util",
     "net",
     "time",
+    "process",
 ] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace"], optional = true }
@@ -30,6 +32,8 @@ base64 = "0.22"
 thiserror = { workspace = true }
 tracing = { version = "0.1", optional = true }
 futures-util = "0.3"
+async-stream = "0.3"
+toml = { workspace = true }
 vt100 = { workspace = true }
 
 [dev-dependencies]
