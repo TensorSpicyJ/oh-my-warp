@@ -3189,6 +3189,12 @@ impl Workspace {
         // pushed by `subscribe_to_settings_errors` and `dismiss_workspace_banner`.
         ws.sync_settings_error_state_into_settings_pane(ctx);
 
+        #[cfg(feature = "omw_local")]
+        {
+            ws.current_workspace_state.is_ai_assistant_panel_open = true;
+            ctx.notify();
+        }
+
         let weak_handle = ctx.handle();
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
             registry.register(window_id, weak_handle);
@@ -4367,23 +4373,27 @@ impl Workspace {
 
     fn toggle_ai_assistant_panel(&mut self, ctx: &mut ViewContext<Self>) {
         if !ChannelState::official_cloud_services_enabled() {
-            return;
-        }
+            #[cfg(not(feature = "omw_local"))]
+            {
+                return;
+            }
+            // omw_local: skip cloud-specific init but still allow toggle.
+        } else {
+            // Now that the user has interacted with the panel, we can close
+            // the dialogue and mark it as dismissed.
+            if self.should_show_ai_assistant_warm_welcome {
+                self.dismiss_ai_assistant_warm_welcome(ctx);
+            }
 
-        // Now that the user has interacted with the panel, we can close
-        // the dialogue and mark it as dismissed.
-        if self.should_show_ai_assistant_warm_welcome {
-            self.dismiss_ai_assistant_warm_welcome(ctx);
+            self.tips_completed.update(ctx, |tips_completed, ctx| {
+                mark_feature_used_and_write_to_user_defaults(
+                    Tip::Action(TipAction::WarpAI),
+                    tips_completed,
+                    ctx,
+                );
+                ctx.notify();
+            });
         }
-
-        self.tips_completed.update(ctx, |tips_completed, ctx| {
-            mark_feature_used_and_write_to_user_defaults(
-                Tip::Action(TipAction::WarpAI),
-                tips_completed,
-                ctx,
-            );
-            ctx.notify();
-        });
 
         // The panel is already open and no models are open, so just refocus the panel.
         // If there is a modal open, it would sit above the Warp AI panel and we would end up
@@ -17390,11 +17400,15 @@ impl Workspace {
         }
 
         // Legacy AI assistant button (non-agent-mode only)
-        if is_online
+        #[cfg(feature = "omw_local")]
+        let show_ai_button = !self.current_workspace_state.is_ai_assistant_panel_open;
+        #[cfg(not(feature = "omw_local"))]
+        let show_ai_button = is_online
             && ChannelState::official_cloud_services_enabled()
             && !FeatureFlag::AgentMode.is_enabled()
             && !is_web_anonymous_user
-            && !self.current_workspace_state.is_ai_assistant_panel_open
+            && !self.current_workspace_state.is_ai_assistant_panel_open;
+        if show_ai_button
         {
             target.add_child(
                 Container::new(
@@ -20749,7 +20763,9 @@ impl TypedActionView for Workspace {
                 );
             }
             ClickedAIAssistantIcon => {
-                if !FeatureFlag::AgentMode.is_enabled() {
+                if !FeatureFlag::AgentMode.is_enabled()
+                    || cfg!(feature = "omw_local")
+                {
                     self.toggle_ai_assistant_panel(ctx);
                     if self.current_workspace_state.is_ai_assistant_panel_open {
                         send_telemetry_from_ctx!(

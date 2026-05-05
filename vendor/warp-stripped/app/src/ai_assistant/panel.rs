@@ -2,6 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Local;
+#[cfg(feature = "omw_local")]
+use reqwest;
+#[cfg(feature = "omw_local")]
+use serde_json;
 
 use pathfinder_geometry::vector::{vec2f, Vector2F};
 use warp_editor::editor::NavigationKey;
@@ -133,6 +137,32 @@ pub struct AIAssistantPanelView {
     mouse_state_handles: MouseStateHandles,
     /// When true, render only the omw placeholder message and skip all upstream AI UI.
     is_omw_placeholder: bool,
+
+    #[cfg(feature = "omw_local")]
+    omw_http: reqwest::Client,
+    #[cfg(feature = "omw_local")]
+    omw_providers: Vec<OmwProviderInfo>,
+    #[cfg(feature = "omw_local")]
+    omw_selected_provider: Option<String>,
+    #[cfg(feature = "omw_local")]
+    omw_messages: Vec<OmwChatMessage>,
+    #[cfg(feature = "omw_local")]
+    omw_is_streaming: bool,
+}
+
+#[cfg(feature = "omw_local")]
+#[derive(Clone)]
+struct OmwProviderInfo {
+    name: String,
+    kind: String,
+    #[allow(dead_code)]
+    default_model: Option<String>,
+}
+
+#[cfg(feature = "omw_local")]
+struct OmwChatMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +175,8 @@ pub enum AIAssistantAction {
     CopyAnswerToClipboard(Arc<String>),
     FocusTerminalInput,
     FocusEditor,
+    #[cfg(feature = "omw_local")]
+    OmwSubmitPrompt,
 }
 
 pub fn init(app: &mut AppContext) {
@@ -179,6 +211,16 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding(cmd_or_ctrl_shift("k")),
+    ]);
+
+    #[cfg(feature = "omw_local")]
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "ai_assistant_panel:omw_submit",
+            "Submit prompt",
+            AIAssistantAction::OmwSubmitPrompt,
+        )
+        .with_key_binding("shift-enter"),
     ]);
 }
 
@@ -254,7 +296,21 @@ impl AIAssistantPanelView {
 
             resizable_state_handle,
             mouse_state_handles: Default::default(),
+            #[cfg(not(feature = "omw_local"))]
             is_omw_placeholder: false,
+            #[cfg(feature = "omw_local")]
+            is_omw_placeholder: true,
+
+            #[cfg(feature = "omw_local")]
+            omw_http: reqwest::Client::new(),
+            #[cfg(feature = "omw_local")]
+            omw_providers: Vec::new(),
+            #[cfg(feature = "omw_local")]
+            omw_selected_provider: None,
+            #[cfg(feature = "omw_local")]
+            omw_messages: Vec::new(),
+            #[cfg(feature = "omw_local")]
+            omw_is_streaming: false,
         };
 
         panel.tick(ctx);
@@ -275,7 +331,141 @@ impl AIAssistantPanelView {
     ) -> Self {
         let mut panel = Self::new(server_api, ai_client, ctx);
         panel.is_omw_placeholder = true;
+        #[cfg(feature = "omw_local")]
+        {
+            panel.omw_http = reqwest::Client::new();
+            panel.omw_providers = Vec::new();
+            panel.omw_selected_provider = None;
+            panel.omw_messages = Vec::new();
+            panel.omw_is_streaming = false;
+
+            let http = panel.omw_http.clone();
+            ctx.spawn(
+                async move {
+                    let resp = http
+                        .get("http://127.0.0.1:8788/api/v1/providers")
+                        .send()
+                        .await?;
+                    let body: serde_json::Value = resp.json().await?;
+                    let providers: Vec<OmwProviderInfo> = body["providers"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|p| {
+                                    Some(OmwProviderInfo {
+                                        name: p.get("name")?.as_str()?.to_string(),
+                                        kind: p.get("kind")?.as_str()?.to_string(),
+                                        default_model: p
+                                            .get("default_model")
+                                            .and_then(|v| v.as_str().map(String::from)),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok::<_, reqwest::Error>(providers)
+                },
+                |this, result, ctx| {
+                    if let Ok(providers) = result {
+                        if !providers.is_empty() {
+                            this.omw_selected_provider =
+                                Some(providers[0].name.clone());
+                        }
+                        this.omw_providers = providers;
+                        ctx.notify();
+                    }
+                },
+            );
+        }
         panel
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn omw_submit_prompt(&mut self, prompt: String, ctx: &mut ViewContext<Self>) {
+        let provider = match &self.omw_selected_provider {
+            Some(p) => p.clone(),
+            None => {
+                self.omw_messages.push(OmwChatMessage {
+                    role: "system".to_string(),
+                    content: "No provider configured. Run: omw provider add <name> --kind openai --key <key>"
+                        .to_string(),
+                });
+                return;
+            }
+        };
+
+        self.omw_messages.push(OmwChatMessage {
+            role: "user".to_string(),
+            content: prompt.clone(),
+        });
+        self.omw_is_streaming = true;
+        self.editor.update(ctx, |editor, ctx| {
+            editor.clear_buffer_and_reset_undo_stack(ctx);
+        });
+        ctx.notify();
+
+        let http = self.omw_http.clone();
+        ctx.spawn(
+            async move {
+                let body = serde_json::json!({
+                    "provider": provider,
+                    "prompt": prompt,
+                });
+                let resp = http
+                    .post("http://127.0.0.1:8788/api/v1/agent/ask")
+                    .json(&body)
+                    .send()
+                    .await?;
+                resp.text().await
+            },
+            |this, result, ctx| {
+                this.omw_is_streaming = false;
+                let content = match result {
+                    Ok(raw) => parse_sse_response(&raw),
+                    Err(e) => format!("Error: {e}"),
+                };
+                this.omw_messages.push(OmwChatMessage {
+                    role: "assistant".to_string(),
+                    content,
+                });
+                ctx.notify();
+            },
+        );
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn render_omw_chat(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let provider_label = self.omw_selected_provider.as_deref().unwrap_or("(no provider)");
+        let mut msg_text = format!("omw AI - {}\n\n", provider_label);
+        for m in &self.omw_messages {
+            msg_text.push_str(&format!("{}: {}\n\n", m.role, m.content));
+        }
+        if self.omw_messages.is_empty() {
+            msg_text.push_str("Type and press Shift+Enter to submit.\n");
+        }
+
+        let text_area = appearance
+            .ui_builder()
+            .wrappable_text(msg_text, true)
+            .with_style(UiComponentStyles {
+                font_family_id: Some(appearance.ui_font_family()),
+                font_size: Some(BODY_FONT_SIZE),
+                font_color: Some(theme.active_ui_text_color().into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        let mut col = Flex::column();
+        col.add_child(Shrinkable::new(1., text_area).finish());
+        // Editor input
+        col.add_child(
+            ConstrainedBox::new(self.render_editor())
+                .with_max_width(1200.)
+                .finish(),
+        );
+        Align::new(Container::new(col.finish()).finish()).finish()
     }
 
     fn on_active_session_change(
@@ -463,12 +653,19 @@ impl AIAssistantPanelView {
             EditorEvent::Enter => {
                 self.input_suggestions_mode = InputSuggestionsMode::Closed;
                 let buffer_text = self.editor.as_ref(ctx).buffer_text(ctx);
-                if !self.is_prompt_too_long(buffer_text.as_str())
-                    && !self.is_prompt_empty(buffer_text.as_str())
-                {
+                if self.is_prompt_empty(buffer_text.as_str()) {
+                    ctx.notify();
+                    return;
+                }
+                #[cfg(feature = "omw_local")]
+                if self.is_omw_placeholder {
+                    self.omw_submit_prompt(buffer_text, ctx);
+                    ctx.notify();
+                    return;
+                }
+                if !self.is_prompt_too_long(buffer_text.as_str()) {
                     self.issue_request(buffer_text, ctx);
                 } else {
-                    // Only send this event if the user tried to execute with a longer than permitted prompt.
                     send_telemetry_from_ctx!(TelemetryEvent::WarpAICharacterLimitExceeded, ctx);
                 }
                 ctx.notify();
@@ -553,6 +750,15 @@ impl AIAssistantPanelView {
                     self.editor.update(ctx, |editor, ctx| editor.move_down(ctx));
                 }
                 ctx.notify();
+            }
+            EditorEvent::ShiftEnter => {
+                if self.is_omw_placeholder {
+                    let buffer_text = self.editor.as_ref(ctx).buffer_text(ctx);
+                    if !buffer_text.trim().is_empty() {
+                        self.omw_submit_prompt(buffer_text, ctx);
+                    }
+                    ctx.notify();
+                }
             }
             _ => {}
         }
@@ -1088,6 +1294,13 @@ impl TypedActionView for AIAssistantPanelView {
                 self.focus_state = PanelFocusState::Editor;
                 ctx.focus_self();
             }
+            #[cfg(feature = "omw_local")]
+            OmwSubmitPrompt => {
+                let buffer_text = self.editor.as_ref(ctx).buffer_text(ctx);
+                if !buffer_text.trim().is_empty() {
+                    self.omw_submit_prompt(buffer_text, ctx);
+                }
+            }
         }
     }
 }
@@ -1099,7 +1312,11 @@ impl View for AIAssistantPanelView {
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
         if self.is_omw_placeholder {
-            // Placeholder has no focusable children. Don't redirect focus into hidden child views.
+            // omw chat has the editor as focusable child.
+            if focus_ctx.is_self_focused() {
+                ctx.focus(&self.editor);
+                ctx.notify();
+            }
             return;
         }
         if focus_ctx.is_self_focused() {
@@ -1120,35 +1337,7 @@ impl View for AIAssistantPanelView {
         let appearance = Appearance::as_ref(app);
 
         if self.is_omw_placeholder {
-            const OMW_PLACEHOLDER_TEXT: &str = "\
-omw-server is running on http://127.0.0.1:8788\n\n\
-Configure providers:\n  omw provider add <name> --kind openai --key <key>\n\
-List providers:\n  omw provider list\n  curl http://127.0.0.1:8788/api/v1/providers\n\
-Agent API:\n  curl -X POST http://127.0.0.1:8788/api/v1/agent/ask \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"provider\":\"<name>\",\"prompt\":\"hello\"}'\n\n\
-GUI agent panel coming in a follow-up release.";
-            let theme = appearance.theme();
-            return Align::new(
-                Container::new(
-                    Shrinkable::new(
-                        1.,
-                        appearance
-                            .ui_builder()
-                            .wrappable_text(OMW_PLACEHOLDER_TEXT.to_string(), true)
-                            .with_style(UiComponentStyles {
-                                font_family_id: Some(appearance.ui_font_family()),
-                                font_size: Some(BODY_FONT_SIZE),
-                                font_color: Some(theme.nonactive_ui_text_color().into()),
-                                ..Default::default()
-                            })
-                            .build()
-                            .finish(),
-                    )
-                    .finish(),
-                )
-                .with_uniform_padding(EDITOR_MARGIN)
-                .finish(),
-            )
-            .finish();
+            return self.render_omw_chat(appearance);
         }
 
         let mut panel = Flex::column().with_main_axis_size(MainAxisSize::Max);
@@ -1243,5 +1432,35 @@ GUI agent panel coming in a follow-up release.";
             )
         }))
         .finish()
+    }
+}
+
+#[cfg(feature = "omw_local")]
+fn parse_sse_response(raw: &str) -> String {
+    let mut result = String::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with("data:") {
+            continue;
+        }
+        let content = line.strip_prefix("data:").unwrap_or("").trim();
+        // Try JSON first (usage, errors, done)
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(delta) = val.get("delta").and_then(|v| v.as_str()) {
+                result.push_str(delta);
+            }
+            if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+                result.push_str(&format!("\n[{}]", err));
+            }
+            // "done" / usage events are ignored for display
+        } else {
+            // Plain text delta
+            result.push_str(content);
+        }
+    }
+    if result.is_empty() {
+        "(no response)".to_string()
+    } else {
+        result
     }
 }

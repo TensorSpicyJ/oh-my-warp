@@ -174,6 +174,10 @@ impl Requests {
 
     /// Starts a Warp AI request against the server with the given request prompt.
     pub fn issue_request(&mut self, request: String, ctx: &mut ModelContext<Self>) {
+        #[cfg(feature = "omw_local")]
+        if !warp_core::channel::ChannelState::official_cloud_services_enabled() {
+            return;
+        }
         let server_api = self.server_api.clone();
         let raw_request = request.trim();
         let request_for_api = raw_request.to_string();

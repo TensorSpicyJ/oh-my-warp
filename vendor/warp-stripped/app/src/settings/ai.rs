@@ -1499,6 +1499,9 @@ impl AISettings {
 
     pub fn is_any_ai_enabled(&self, app: &AppContext) -> bool {
         if !ChannelState::official_cloud_services_enabled() {
+            #[cfg(feature = "omw_local")]
+            return true;
+            #[cfg(not(feature = "omw_local"))]
             return false;
         }
 
