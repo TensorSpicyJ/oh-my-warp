@@ -413,16 +413,22 @@ impl AIAssistantPanelView {
                 });
                 let resp = http
                     .post("http://127.0.0.1:8788/api/v1/agent/ask")
+                    .timeout(std::time::Duration::from_secs(60))
                     .json(&body)
                     .send()
-                    .await?;
-                resp.text().await
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                Ok::<_, String>(String::from_utf8_lossy(&bytes).to_string())
             },
-            |this, result, ctx| {
+            |this, result: Result<String, String>, ctx| {
                 this.omw_is_streaming = false;
                 let content = match result {
                     Ok(raw) => parse_sse_response(&raw),
-                    Err(e) => format!("Error: {e}"),
+                    Err(e) => e,
                 };
                 this.omw_messages.push(OmwChatMessage {
                     role: "assistant".to_string(),
