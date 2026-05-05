@@ -3192,6 +3192,8 @@ impl Workspace {
         #[cfg(feature = "omw_local")]
         {
             ws.current_workspace_state.is_ai_assistant_panel_open = true;
+            // Auto-start omw-remote daemon so remote control is immediately testable.
+            let _ = crate::omw::OmwRemoteState::shared().start();
             ctx.notify();
         }
 
@@ -4395,16 +4397,17 @@ impl Workspace {
             });
         }
 
-        // The panel is already open and no models are open, so just refocus the panel.
-        // If there is a modal open, it would sit above the Warp AI panel and we would end up
-        // focusing the Warp AI panel _behind_ the floating modal. Instead, we opt for the normal
-        // toggle behavior which will close the current modal view and then toggle Warp AI.
-        if self.current_workspace_state.is_ai_assistant_panel_open
-            && !self.ai_assistant_panel.is_self_or_child_focused(ctx)
-            && !self.current_workspace_state.is_any_modal_open(ctx)
+        // In omw_local mode, always toggle — no refocus shortcut.
+        #[cfg(not(feature = "omw_local"))]
         {
-            ctx.focus(&self.ai_assistant_panel);
-            return;
+            // The panel is already open and no models are open, so just refocus the panel.
+            if self.current_workspace_state.is_ai_assistant_panel_open
+                && !self.ai_assistant_panel.is_self_or_child_focused(ctx)
+                && !self.current_workspace_state.is_any_modal_open(ctx)
+            {
+                ctx.focus(&self.ai_assistant_panel);
+                return;
+            }
         }
 
         // Otherwise, open / close the panel accordingly.
@@ -17401,7 +17404,7 @@ impl Workspace {
 
         // Legacy AI assistant button (non-agent-mode only)
         #[cfg(feature = "omw_local")]
-        let show_ai_button = !self.current_workspace_state.is_ai_assistant_panel_open;
+        let show_ai_button = true;
         #[cfg(not(feature = "omw_local"))]
         let show_ai_button = is_online
             && ChannelState::official_cloud_services_enabled()

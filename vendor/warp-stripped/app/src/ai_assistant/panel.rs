@@ -443,7 +443,7 @@ impl AIAssistantPanelView {
     fn render_omw_chat(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let provider_label = self.omw_selected_provider.as_deref().unwrap_or("(no provider)");
-        let mut msg_text = format!("omw AI - {}\n\n", provider_label);
+        let mut msg_text = format!("omw AI - {}  [X close]\n\n", provider_label);
         for m in &self.omw_messages {
             msg_text.push_str(&format!("{}: {}\n\n", m.role, m.content));
         }

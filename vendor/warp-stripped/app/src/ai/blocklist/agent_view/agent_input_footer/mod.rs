@@ -2128,6 +2128,11 @@ impl View for AgentInputFooter {
                     right_buttons.add_child(element);
                 }
             }
+            // Always show Phone button in omw_local footer
+            #[cfg(feature = "omw_local")]
+            {
+                right_buttons.add_child(ChildView::new(&self.omw_pair_button).finish());
+            }
         }
 
         let content = Wrap::row()
