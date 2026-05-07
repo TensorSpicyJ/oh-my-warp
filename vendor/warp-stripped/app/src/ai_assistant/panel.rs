@@ -457,6 +457,8 @@ impl AIAssistantPanelView {
             }
         };
 
+        // Remove any pending confirm message before pushing new messages.
+        self.omw_messages.retain(|m| m.role != "_confirm");
         // Push user message + empty assistant placeholder for incremental fill.
         self.omw_messages.push(OmwChatMessage {
             role: "user".to_string(),
@@ -583,7 +585,10 @@ impl AIAssistantPanelView {
             Some(p) => p,
             None => return,
         };
-        if let Ok(json) = serde_json::to_string_pretty(&self.omw_messages) {
+        let visible: Vec<&OmwChatMessage> = self.omw_messages.iter()
+            .filter(|m| m.role != "_confirm")
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&visible) {
             let _ = std::fs::write(&path, json);
         }
     }
@@ -787,16 +792,19 @@ impl AIAssistantPanelView {
         let mut col = Flex::column();
         col.add_child(header);
         col.add_child(
-            Container::new(
-                ClippedScrollable::vertical(
-                    self.omw_scroll_state.clone(),
-                    msg_col.finish(),
-                    ScrollbarWidth::None,
-                    dim_color.into(),
-                    text_color.into(),
-                    Fill::None,
-                ).finish(),
-            ).with_margin_top(8.).finish(),
+            Shrinkable::new(
+                1.,
+                Container::new(
+                    ClippedScrollable::vertical(
+                        self.omw_scroll_state.clone(),
+                        msg_col.finish(),
+                        ScrollbarWidth::None,
+                        dim_color.into(),
+                        text_color.into(),
+                        Fill::None,
+                    ).finish(),
+                ).with_margin_top(8.).finish(),
+            ).finish(),
         );
         col.add_child(
             ConstrainedBox::new(self.render_editor())
