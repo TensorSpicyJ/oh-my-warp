@@ -147,6 +147,10 @@ pub struct AIAssistantPanelView {
     #[cfg(feature = "omw_local")]
     omw_selected_provider: Option<String>,
     #[cfg(feature = "omw_local")]
+    omw_selected_model: Option<String>,
+    #[cfg(feature = "omw_local")]
+    omw_available_models: Vec<String>,
+    #[cfg(feature = "omw_local")]
     omw_messages: Vec<OmwChatMessage>,
     #[cfg(feature = "omw_local")]
     omw_is_streaming: bool,
@@ -181,6 +185,8 @@ pub enum AIAssistantAction {
     OmwSubmitPrompt,
     #[cfg(feature = "omw_local")]
     OmwCycleProvider,
+    #[cfg(feature = "omw_local")]
+    OmwCycleModel,
 }
 
 pub fn init(app: &mut AppContext) {
@@ -232,6 +238,13 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding("ctrl-shift-p"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_cycle_model",
+            "Cycle AI model",
+            AIAssistantAction::OmwCycleModel,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-shift-m"),
     ]);
 }
 
@@ -319,6 +332,10 @@ impl AIAssistantPanelView {
             #[cfg(feature = "omw_local")]
             omw_selected_provider: None,
             #[cfg(feature = "omw_local")]
+            omw_selected_model: None,
+            #[cfg(feature = "omw_local")]
+            omw_available_models: Vec::new(),
+            #[cfg(feature = "omw_local")]
             omw_messages: Vec::new(),
             #[cfg(feature = "omw_local")]
             omw_is_streaming: false,
@@ -347,6 +364,8 @@ impl AIAssistantPanelView {
             panel.omw_http = reqwest::Client::new();
             panel.omw_providers = Vec::new();
             panel.omw_selected_provider = None;
+            panel.omw_selected_model = None;
+            panel.omw_available_models = Vec::new();
             panel.omw_messages = Vec::new();
             panel.omw_is_streaming = false;
 
@@ -381,6 +400,10 @@ impl AIAssistantPanelView {
                         if !providers.is_empty() {
                             this.omw_selected_provider =
                                 Some(providers[0].name.clone());
+                            this.omw_selected_model =
+                                providers[0].default_model.clone();
+                            this.omw_available_models =
+                                Self::models_for_kind(&providers[0].kind);
                         }
                         this.omw_providers = providers;
                         ctx.notify();
@@ -428,12 +451,14 @@ impl AIAssistantPanelView {
         // appends them on the main thread and re-renders incrementally.
         let (tx, rx) = async_channel::unbounded::<String>();
         let http = self.omw_http.clone();
+        let model_for_req = self.omw_selected_model.clone();
 
         ctx.spawn(
             async move {
                 let body = serde_json::json!({
                     "provider": provider,
                     "prompt": prompt,
+                    "model": model_for_req,
                 });
                 let resp = match http
                     .post("http://127.0.0.1:8788/api/v1/agent/ask")
@@ -523,18 +548,40 @@ impl AIAssistantPanelView {
         );
     }
 
+    /// Known models per provider kind for model cycling.
+    #[cfg(feature = "omw_local")]
+    fn models_for_kind(kind: &str) -> Vec<String> {
+        match kind {
+            "openai" => vec![
+                "gpt-4o".into(),
+                "gpt-4o-mini".into(),
+                "gpt-4.1".into(),
+                "o4-mini".into(),
+            ],
+            "anthropic" => vec![
+                "claude-sonnet-4-6".into(),
+                "claude-haiku-4-5".into(),
+                "claude-opus-4-7".into(),
+            ],
+            "openai-compatible" => vec![
+                "deepseek-v4-pro".into(),
+                "deepseek-v4-pro-1m".into(),
+            ],
+            _ => vec![],
+        }
+    }
+
     #[cfg(feature = "omw_local")]
     fn render_omw_chat(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let provider_label = self.omw_selected_provider.as_deref().unwrap_or("(no provider)");
-        let n_providers = self.omw_providers.len();
+        let model_label = self.omw_selected_model.as_deref().unwrap_or("(default)");
 
-        // ── Header: provider name (clickable to cycle) ──
-        let header_text = if n_providers > 1 {
-            format!("omw AI — {}  [{} providers, click to switch]\n\n", provider_label, n_providers)
-        } else {
-            format!("omw AI — {}\n\n", provider_label)
-        };
+        // ── Header ──
+        let header_text = format!(
+            "omw AI — {} | model: {}\n[ctrl-shift-p] provider  [ctrl-shift-m] model\n\n",
+            provider_label, model_label
+        );
 
         // ── Messages with labels ──
         let mut msg_text = header_text;
@@ -1417,6 +1464,20 @@ impl TypedActionView for AIAssistantPanelView {
                         .unwrap_or(0);
                     let next = (pos + 1) % self.omw_providers.len();
                     self.omw_selected_provider = Some(self.omw_providers[next].name.clone());
+                    self.omw_selected_model = self.omw_providers[next].default_model.clone();
+                    self.omw_available_models = Self::models_for_kind(&self.omw_providers[next].kind);
+                    ctx.notify();
+                }
+            }
+            #[cfg(feature = "omw_local")]
+            OmwCycleModel => {
+                if self.omw_available_models.len() > 1 {
+                    let cur = self.omw_selected_model.clone();
+                    let pos = self.omw_available_models.iter()
+                        .position(|m| Some(m.as_str()) == cur.as_deref())
+                        .unwrap_or(0);
+                    let next = (pos + 1) % self.omw_available_models.len();
+                    self.omw_selected_model = Some(self.omw_available_models[next].clone());
                     ctx.notify();
                 }
             }
