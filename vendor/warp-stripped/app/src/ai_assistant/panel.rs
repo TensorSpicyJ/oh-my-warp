@@ -179,6 +179,8 @@ pub enum AIAssistantAction {
     FocusEditor,
     #[cfg(feature = "omw_local")]
     OmwSubmitPrompt,
+    #[cfg(feature = "omw_local")]
+    OmwCycleProvider,
 }
 
 pub fn init(app: &mut AppContext) {
@@ -223,6 +225,13 @@ pub fn init(app: &mut AppContext) {
             AIAssistantAction::OmwSubmitPrompt,
         )
         .with_key_binding("shift-enter"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_cycle_provider",
+            "Cycle AI provider",
+            AIAssistantAction::OmwCycleProvider,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-shift-p"),
     ]);
 }
 
@@ -518,14 +527,28 @@ impl AIAssistantPanelView {
     fn render_omw_chat(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let provider_label = self.omw_selected_provider.as_deref().unwrap_or("(no provider)");
-        let mut msg_text = format!("omw AI - {}  [X close]\n\n", provider_label);
+        let n_providers = self.omw_providers.len();
+
+        // ── Header: provider name (clickable to cycle) ──
+        let header_text = if n_providers > 1 {
+            format!("omw AI — {}  [{} providers, click to switch]\n\n", provider_label, n_providers)
+        } else {
+            format!("omw AI — {}\n\n", provider_label)
+        };
+
+        // ── Messages with labels ──
+        let mut msg_text = header_text;
         for m in &self.omw_messages {
-            msg_text.push_str(&format!("{}: {}\n\n", m.role, m.content));
+            match m.role.as_str() {
+                "user" => msg_text.push_str(&format!("▸ You\n{}\n\n", m.content)),
+                "assistant" => msg_text.push_str(&format!("▸ AI\n{}\n\n", m.content)),
+                other => msg_text.push_str(&format!("▸ {}\n{}\n\n", other, m.content)),
+            }
         }
         if self.omw_is_streaming {
-            msg_text.push_str("...\n");
+            msg_text.push_str("▸ AI\n...\n");
         }
-        if self.omw_messages.is_empty() {
+        if self.omw_messages.is_empty() && !self.omw_is_streaming {
             msg_text.push_str("Type and press Shift+Enter to submit.\n");
         }
 
@@ -1383,6 +1406,18 @@ impl TypedActionView for AIAssistantPanelView {
                 let buffer_text = self.editor.as_ref(ctx).buffer_text(ctx);
                 if !buffer_text.trim().is_empty() {
                     self.omw_submit_prompt(buffer_text, ctx);
+                }
+            }
+            #[cfg(feature = "omw_local")]
+            OmwCycleProvider => {
+                if self.omw_providers.len() > 1 {
+                    let cur = self.omw_selected_provider.clone();
+                    let pos = self.omw_providers.iter()
+                        .position(|p| Some(p.name.as_str()) == cur.as_deref())
+                        .unwrap_or(0);
+                    let next = (pos + 1) % self.omw_providers.len();
+                    self.omw_selected_provider = Some(self.omw_providers[next].name.clone());
+                    ctx.notify();
                 }
             }
         }
