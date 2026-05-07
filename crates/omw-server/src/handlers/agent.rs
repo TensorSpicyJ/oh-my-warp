@@ -232,9 +232,13 @@ fn resolve_keychain_helper() -> Option<String> {
             if d.join(&name).exists() {
                 return Some(d.join(&name).to_string_lossy().to_string());
             }
-            let umbrella_target = d.join("target").join("debug").join(&name);
-            if umbrella_target.exists() {
-                return Some(umbrella_target.to_string_lossy().to_string());
+            let umbrella_debug = d.join("target").join("debug").join(&name);
+            if umbrella_debug.exists() {
+                return Some(umbrella_debug.to_string_lossy().to_string());
+            }
+            let umbrella_release = d.join("target").join("release").join(&name);
+            if umbrella_release.exists() {
+                return Some(umbrella_release.to_string_lossy().to_string());
             }
             if d.parent().is_none() || d.as_os_str().is_empty() {
                 break;
