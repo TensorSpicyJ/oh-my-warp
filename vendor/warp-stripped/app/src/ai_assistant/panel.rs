@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use chrono::Local;
 #[cfg(feature = "omw_local")]
+use futures::StreamExt;
+#[cfg(feature = "omw_local")]
 use reqwest;
 #[cfg(feature = "omw_local")]
 use serde_json;
@@ -382,6 +384,10 @@ impl AIAssistantPanelView {
 
     #[cfg(feature = "omw_local")]
     fn omw_submit_prompt(&mut self, prompt: String, ctx: &mut ViewContext<Self>) {
+        // Guard against concurrent streaming requests.
+        if self.omw_is_streaming {
+            return;
+        }
         let provider = match &self.omw_selected_provider {
             Some(p) => p.clone(),
             None => {
@@ -394,9 +400,14 @@ impl AIAssistantPanelView {
             }
         };
 
+        // Push user message + empty assistant placeholder for incremental fill.
         self.omw_messages.push(OmwChatMessage {
             role: "user".to_string(),
             content: prompt.clone(),
+        });
+        self.omw_messages.push(OmwChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
         });
         self.omw_is_streaming = true;
         self.editor.update(ctx, |editor, ctx| {
@@ -404,36 +415,100 @@ impl AIAssistantPanelView {
         });
         ctx.notify();
 
+        // async_channel bridge: HTTP task sends deltas → spawn_stream_local
+        // appends them on the main thread and re-renders incrementally.
+        let (tx, rx) = async_channel::unbounded::<String>();
         let http = self.omw_http.clone();
+
         ctx.spawn(
             async move {
                 let body = serde_json::json!({
                     "provider": provider,
                     "prompt": prompt,
                 });
-                let resp = http
+                let resp = match http
                     .post("http://127.0.0.1:8788/api/v1/agent/ask")
                     .timeout(std::time::Duration::from_secs(60))
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| format!("{e}"))?;
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("{e}"))?;
-                Ok::<_, String>(String::from_utf8_lossy(&bytes).to_string())
-            },
-            |this, result: Result<String, String>, ctx| {
-                this.omw_is_streaming = false;
-                let content = match result {
-                    Ok(raw) => parse_sse_response(&raw),
-                    Err(e) => e,
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(format!("[Connection error: {}]", e)).await;
+                        return;
+                    }
                 };
-                this.omw_messages.push(OmwChatMessage {
-                    role: "assistant".to_string(),
-                    content,
-                });
+                if !resp.status().is_success() {
+                    let _ = tx
+                        .send(format!("[Server returned HTTP {}]", resp.status()))
+                        .await;
+                    return;
+                }
+
+                let mut byte_stream = resp.bytes_stream();
+                let mut buf = String::new();
+
+                while let Some(chunk_result) = byte_stream.next().await {
+                    let bytes = match chunk_result {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = tx
+                                .send(format!("\n[Stream error: {}]", e))
+                                .await;
+                            break;
+                        }
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+
+                    // Extract and forward complete SSE lines.
+                    while let Some(nl_pos) = buf.find('\n') {
+                        let line = buf[..nl_pos].trim().to_string();
+                        buf = buf[nl_pos + 1..].to_string();
+
+                        if let Some(content) = line.strip_prefix("data:") {
+                            let content = content.trim();
+                            if content.is_empty() {
+                                continue;
+                            }
+                            if let Ok(val) =
+                                serde_json::from_str::<serde_json::Value>(content)
+                            {
+                                if let Some(delta) =
+                                    val.get("delta").and_then(|v| v.as_str())
+                                {
+                                    let _ = tx.send(delta.to_string()).await;
+                                } else if let Some(err) =
+                                    val.get("error").and_then(|v| v.as_str())
+                                {
+                                    let _ = tx
+                                        .send(format!("\n[Error: {}]", err))
+                                        .await;
+                                }
+                                // usage / done events silently consumed
+                            } else {
+                                let _ = tx.send(content.to_string()).await;
+                            }
+                        }
+                    }
+                }
+                // tx dropped → rx stream ends → on_done fires
+            },
+            |_, _, _| {}, // no-op; spawn_stream_local handles UI teardown
+        );
+
+        // Main-thread stream consumer: appends each delta to the last message
+        // and re-renders immediately.
+        ctx.spawn_stream_local(
+            rx,
+            |this, delta, ctx| {
+                if let Some(last) = this.omw_messages.last_mut() {
+                    last.content.push_str(&delta);
+                    ctx.notify();
+                }
+            },
+            |this, ctx| {
+                this.omw_is_streaming = false;
                 ctx.notify();
             },
         );
@@ -446,6 +521,9 @@ impl AIAssistantPanelView {
         let mut msg_text = format!("omw AI - {}  [X close]\n\n", provider_label);
         for m in &self.omw_messages {
             msg_text.push_str(&format!("{}: {}\n\n", m.role, m.content));
+        }
+        if self.omw_is_streaming {
+            msg_text.push_str("...\n");
         }
         if self.omw_messages.is_empty() {
             msg_text.push_str("Type and press Shift+Enter to submit.\n");
@@ -1438,35 +1516,5 @@ impl View for AIAssistantPanelView {
             )
         }))
         .finish()
-    }
-}
-
-#[cfg(feature = "omw_local")]
-fn parse_sse_response(raw: &str) -> String {
-    let mut result = String::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || !line.starts_with("data:") {
-            continue;
-        }
-        let content = line.strip_prefix("data:").unwrap_or("").trim();
-        // Try JSON first (usage, errors, done)
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-            if let Some(delta) = val.get("delta").and_then(|v| v.as_str()) {
-                result.push_str(delta);
-            }
-            if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-                result.push_str(&format!("\n[{}]", err));
-            }
-            // "done" / usage events are ignored for display
-        } else {
-            // Plain text delta
-            result.push_str(content);
-        }
-    }
-    if result.is_empty() {
-        "(no response)".to_string()
-    } else {
-        result
     }
 }
