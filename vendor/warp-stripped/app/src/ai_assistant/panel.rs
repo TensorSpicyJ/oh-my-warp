@@ -230,6 +230,7 @@ pub fn init(app: &mut AppContext) {
             "Submit prompt",
             AIAssistantAction::OmwSubmitPrompt,
         )
+        .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding("shift-enter"),
         EditableBinding::new(
             "ai_assistant_panel:omw_cycle_provider",
@@ -237,14 +238,14 @@ pub fn init(app: &mut AppContext) {
             AIAssistantAction::OmwCycleProvider,
         )
         .with_context_predicate(id!("AIAssistantPanel"))
-        .with_key_binding("ctrl-shift-p"),
+        .with_key_binding("ctrl-alt-p"),
         EditableBinding::new(
             "ai_assistant_panel:omw_cycle_model",
             "Cycle AI model",
             AIAssistantAction::OmwCycleModel,
         )
         .with_context_predicate(id!("AIAssistantPanel"))
-        .with_key_binding("ctrl-shift-m"),
+        .with_key_binding("ctrl-alt-m"),
     ]);
 }
 
@@ -564,6 +565,8 @@ impl AIAssistantPanelView {
                 "claude-opus-4-7".into(),
             ],
             "openai-compatible" => vec![
+                "deepseek-chat".into(),
+                "deepseek-reasoner".into(),
                 "deepseek-v4-pro".into(),
                 "deepseek-v4-pro-1m".into(),
             ],
@@ -579,7 +582,7 @@ impl AIAssistantPanelView {
 
         // ── Header ──
         let header_text = format!(
-            "omw AI — {} | model: {}\n[ctrl-shift-p] provider  [ctrl-shift-m] model\n\n",
+            "omw AI — {} | model: {}\n[ctrl-alt-p] provider  [ctrl-alt-m] model\n\n",
             provider_label, model_label
         );
 
