@@ -742,7 +742,21 @@ impl AIAssistantPanelView {
                 .with_max_width(1200.)
                 .finish(),
         );
-        Align::new(Container::new(col.finish()).finish()).finish()
+        let panel_content =
+            Align::new(Container::new(col.finish()).finish()).finish();
+        Resizable::new(
+            self.resizable_state_handle.clone(),
+            panel_content,
+        )
+        .on_resize(move |ctx, _| ctx.notify())
+        .with_dragbar_side(DragBarSide::Left)
+        .with_bounds_callback(Box::new(|window_bounds| {
+            (
+                MIN_PANEL_WIDTH,
+                (window_bounds.x() - MIN_REMAINING_WINDOW_SIZE).max(MIN_PANEL_WIDTH),
+            )
+        }))
+        .finish()
     }
     fn on_active_session_change(
         &mut self,
