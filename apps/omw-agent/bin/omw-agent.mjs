@@ -9,6 +9,7 @@ import { runCli } from "../dist/src/cli.js";
 const code = await runCli(process.argv.slice(2), process.env, {
 	stdout: process.stdout,
 	stderr: process.stderr,
+	emitDelimiters: !process.stdout.isTTY,
 });
 // Drain stdout/stderr before exit so the final usage JSON line on stderr
 // (and any tail of streamed text on stdout) is not truncated under pipe.

@@ -21,6 +21,10 @@ export interface RunCliOptions {
 	stderr: NodeJS.WritableStream;
 	fetchImpl?: typeof fetch;
 	getKeychainSecretImpl?: (keyRef: string) => Promise<string | undefined>;
+	/** Emit '\n' after each text delta so line-based consumers (e.g.,
+	 *  omw-server via BufReader::lines()) receive each chunk immediately.
+	 *  Defaults to false (raw concatenation, suitable for TTY). */
+	emitDelimiters?: boolean;
 }
 
 interface ProviderConfigCommon {
@@ -139,6 +143,7 @@ export async function runCli(
 			flags,
 			apiKey,
 			stdout,
+			opts.emitDelimiters ?? false,
 		);
 	} catch (e) {
 		const msg = (e as Error).message ?? String(e);
@@ -319,6 +324,7 @@ async function dispatchAndStream(
 	flags: ParsedFlags,
 	apiKey: string | undefined,
 	stdout: NodeJS.WritableStream,
+	emitDelimiters: boolean,
 ): Promise<UsageTotals> {
 	switch (provider.kind) {
 		case "openai":
@@ -330,6 +336,7 @@ async function dispatchAndStream(
 				model,
 				flags,
 				stdout,
+				emitDelimiters,
 			);
 		case "anthropic":
 			return await streamAnthropic(
@@ -338,6 +345,7 @@ async function dispatchAndStream(
 				model,
 				flags,
 				stdout,
+				emitDelimiters,
 			);
 		case "ollama":
 			return await streamOllama(
@@ -347,6 +355,7 @@ async function dispatchAndStream(
 				model,
 				flags,
 				stdout,
+				emitDelimiters,
 			);
 		default:
 			throw new Error(`unsupported provider kind: ${provider.kind}`);
@@ -367,6 +376,7 @@ async function streamOpenAi(
 	model: string,
 	flags: ParsedFlags,
 	stdout: NodeJS.WritableStream,
+	emitDelimiters: boolean,
 ): Promise<UsageTotals> {
 	const body: Record<string, unknown> = {
 		model,
@@ -410,6 +420,7 @@ async function streamOpenAi(
 			const delta = choices[0].delta?.content;
 			if (typeof delta === "string" && delta.length > 0) {
 				stdout.write(delta);
+				if (emitDelimiters) stdout.write("\n");
 			}
 		}
 		const u = parsed.usage as
@@ -433,6 +444,7 @@ async function streamAnthropic(
 	model: string,
 	flags: ParsedFlags,
 	stdout: NodeJS.WritableStream,
+	emitDelimiters: boolean,
 ): Promise<UsageTotals> {
 	const url = `${ANTHROPIC_BASE_URL}/v1/messages`;
 	const body: Record<string, unknown> = {
@@ -471,6 +483,7 @@ async function streamAnthropic(
 			const delta = parsed.delta as { text?: string } | undefined;
 			if (delta && typeof delta.text === "string") {
 				stdout.write(delta.text);
+				if (emitDelimiters) stdout.write("\n");
 			}
 		} else if (type === "message_start") {
 			const msg = parsed.message as
@@ -502,6 +515,7 @@ async function streamOllama(
 	model: string,
 	flags: ParsedFlags,
 	stdout: NodeJS.WritableStream,
+	emitDelimiters: boolean,
 ): Promise<UsageTotals> {
 	const base = (provider.base_url ?? OLLAMA_DEFAULT_BASE_URL).replace(
 		/\/+$/,
@@ -544,6 +558,7 @@ async function streamOllama(
 		const message = parsed.message as { content?: string } | undefined;
 		if (message && typeof message.content === "string") {
 			stdout.write(message.content);
+			if (emitDelimiters) stdout.write("\n");
 		}
 		if (parsed.done === true) {
 			if (typeof parsed.prompt_eval_count === "number") {
