@@ -8,16 +8,19 @@ use futures::StreamExt;
 use reqwest;
 #[cfg(feature = "omw_local")]
 use serde_json;
+#[cfg(feature = "omw_local")]
+use warpui::units::IntoPixels;
 
 use pathfinder_geometry::vector::{vec2f, Vector2F};
 use warp_editor::editor::NavigationKey;
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
-    resizable_state_handle, Align, Border, ChildAnchor, ConstrainedBox, Container, CornerRadius,
+    resizable_state_handle, Align, Border, ChildAnchor, ClippedScrollStateHandle,
+    ClippedScrollable, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, DragBarSide, Empty, EventHandler, Fill, Flex,
     HyperlinkUrl, Icon, MainAxisAlignment, MainAxisSize, OffsetPositioning, ParentAnchor,
     PositionedElementAnchor, PositionedElementOffsetBounds, Radius, SavePosition, Shrinkable,
-    Stack, Text,
+    Padding, ScrollbarWidth, Stack, Text,
 };
 use warpui::fonts::Properties;
 use warpui::keymap::{EditableBinding, FixedBinding};
@@ -154,6 +157,8 @@ pub struct AIAssistantPanelView {
     omw_messages: Vec<OmwChatMessage>,
     #[cfg(feature = "omw_local")]
     omw_is_streaming: bool,
+    #[cfg(feature = "omw_local")]
+    omw_scroll_state: ClippedScrollStateHandle,
 }
 
 #[cfg(feature = "omw_local")]
@@ -163,6 +168,12 @@ struct OmwProviderInfo {
     kind: String,
     #[allow(dead_code)]
     default_model: Option<String>,
+}
+
+#[cfg(feature = "omw_local")]
+enum CodeSegment {
+    Text(String),
+    CodeBlock(String),
 }
 
 #[cfg(feature = "omw_local")]
@@ -350,6 +361,8 @@ impl AIAssistantPanelView {
             omw_messages: Vec::new(),
             #[cfg(feature = "omw_local")]
             omw_is_streaming: false,
+            #[cfg(feature = "omw_local")]
+            omw_scroll_state: Default::default(),
         };
 
         panel.tick(ctx);
@@ -379,6 +392,7 @@ impl AIAssistantPanelView {
             panel.omw_available_models = Vec::new();
             panel.omw_messages = Self::load_chat_history();
             panel.omw_is_streaming = false;
+            panel.omw_scroll_state = Default::default();
 
             let http = panel.omw_http.clone();
             ctx.spawn(
@@ -550,6 +564,7 @@ impl AIAssistantPanelView {
             |this, delta, ctx| {
                 if let Some(last) = this.omw_messages.last_mut() {
                     last.content.push_str(&delta);
+                    this.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
                     ctx.notify();
                 }
             },
@@ -601,6 +616,37 @@ impl AIAssistantPanelView {
         Some(p)
     }
 
+    /// Split message content into text and code-block segments on ``` fences.
+    #[cfg(feature = "omw_local")]
+    fn split_code_segments(content: &str) -> Vec<CodeSegment> {
+        let mut out = vec![];
+        let mut in_code = false;
+        let mut buf = String::new();
+        for line in content.lines() {
+            if line.trim().starts_with("```") {
+                if in_code {
+                    if !buf.is_empty() || matches!(out.last(), Some(CodeSegment::CodeBlock(_))) {
+                        out.push(CodeSegment::CodeBlock(std::mem::take(&mut buf)));
+                    }
+                    in_code = false;
+                } else {
+                    if !buf.is_empty() {
+                        out.push(CodeSegment::Text(std::mem::take(&mut buf)));
+                    }
+                    in_code = true;
+                }
+            } else {
+                if !buf.is_empty() { buf.push('\n'); }
+                buf.push_str(line);
+            }
+        }
+        if !buf.is_empty() {
+            if in_code { out.push(CodeSegment::CodeBlock(buf)); }
+            else { out.push(CodeSegment::Text(buf)); }
+        }
+        out
+    }
+
     /// Known models per provider kind for model cycling.
     #[cfg(feature = "omw_local")]
     fn models_for_kind(kind: &str) -> Vec<String> {
@@ -633,130 +679,136 @@ impl AIAssistantPanelView {
         let font = appearance.ui_font_family();
         let provider_label = self.omw_selected_provider.as_deref().unwrap_or("(no provider)");
         let model_label = self.omw_selected_model.as_deref().unwrap_or("(default)");
-        let text_color = theme.active_ui_text_color(); // Fill
+        let text_color = blended_colors::text_sub(theme, theme.surface_2());
         let dim_color = blended_colors::text_sub(theme, theme.surface_2());
-        let ai_bg = theme.surface_2();
-        let user_bg = theme.surface_3();
+        let code_bg = theme.surface_3();
+        let n_providers = self.omw_providers.len();
+        let n_models = self.omw_available_models.len();
+        let cur_p = self.omw_providers.iter()
+            .position(|p| Some(p.name.as_str()) == self.omw_selected_provider.as_deref())
+            .map(|i| i + 1).unwrap_or(0);
+        let cur_m = self.omw_available_models.iter()
+            .position(|m| Some(m.as_str()) == self.omw_selected_model.as_deref())
+            .map(|i| i + 1).unwrap_or(0);
 
-        // ── Header row ──
-        let header = Container::new(
-            Flex::row()
-                .with_child(
-                    Text::new_inline(
-                        format!("omw AI — {} | {}", provider_label, model_label),
-                        font,
-                        BODY_FONT_SIZE,
-                    )
-                    .with_color(blended_colors::text_sub(theme, theme.surface_2()))
-                    .finish(),
-                )
-                .finish(),
-        )
-        .with_padding_bottom(4.)
-        .finish();
-
-        let shortcuts = Text::new_inline(
-            "ctrl-alt-p:provider  ctrl-alt-m:model  ctrl-alt-x:clear",
-            font,
-            10.,
-        )
-        .with_color(dim_color)
-        .finish();
+        // ── Header ──
+        let header = Text::new_inline(
+            format!("omw AI — {} [{}/{}] | {} [{}/{}]  [ctrl-alt-x:clear]",
+                provider_label, cur_p, n_providers, model_label, cur_m, n_models),
+            font, BODY_FONT_SIZE,
+        ).with_color(text_color).finish();
 
         // ── Messages ──
         let mut msg_col = Flex::column();
         for m in &self.omw_messages {
-            let (label, bg) = match m.role.as_str() {
-                "user" => ("▸ You", user_bg),
-                _ => ("▸ AI", ai_bg),
-            };
-            let block = Container::new(
-                Flex::column()
-                    .with_child(
-                        Text::new_inline(label, font, BODY_FONT_SIZE)
-                            .with_style(Properties {
-                                weight: warpui::fonts::Weight::Bold,
-                                ..Default::default()
-                            })
-                            .with_color(blended_colors::text_sub(theme, bg))
+            if m.role == "_confirm" { continue; }
+            let is_user = m.role == "user";
+            let label = if is_user { "▸ You" } else { "▸ AI" };
+            let bg = if is_user { theme.surface_3() } else { theme.surface_2() };
+
+            let mut block_col = Flex::column();
+            block_col.add_child(
+                Text::new_inline(label, font, BODY_FONT_SIZE)
+                    .with_style(Properties { weight: warpui::fonts::Weight::Bold, ..Default::default() })
+                    .with_color(text_color).finish(),
+            );
+
+            let segments = Self::split_code_segments(&m.content);
+            for seg in &segments {
+                match seg {
+                    CodeSegment::Text(t) => {
+                        if !t.is_empty() {
+                            block_col.add_child(
+                                appearance.ui_builder()
+                                    .wrappable_text(t.clone(), true)
+                                    .with_style(UiComponentStyles {
+                                        font_family_id: Some(font),
+                                        font_size: Some(BODY_FONT_SIZE),
+                                        font_color: Some(text_color.into()),
+                                        ..Default::default()
+                                    }).build().finish(),
+                            );
+                        }
+                    }
+                    CodeSegment::CodeBlock(code) => {
+                        block_col.add_child(
+                            Container::new(
+                                appearance.ui_builder()
+                                    .wrappable_text(code.clone(), false)
+                                    .with_style(UiComponentStyles {
+                                        font_family_id: Some(appearance.monospace_font_family()),
+                                        font_size: Some(11.),
+                                        font_color: Some(dim_color.into()),
+                                        ..Default::default()
+                                    }).build().finish(),
+                            )
+                            .with_background(code_bg)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                            .with_padding(Padding::uniform(4.))
+                            .with_padding_left(8.)
+                            .with_margin_top(2.)
+                            .with_margin_bottom(2.)
                             .finish(),
-                    )
-                    .with_child(
-                        appearance
-                            .ui_builder()
-                            .wrappable_text(m.content.clone(), true)
-                            .with_style(UiComponentStyles {
-                                font_family_id: Some(font),
-                                font_size: Some(BODY_FONT_SIZE),
-                                font_color: Some(text_color.into()),
-                                ..Default::default()
-                            })
-                            .build()
-                            .finish(),
-                    )
-                    .finish(),
-            )
-            .with_background(bg)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_padding_top(4.)
-            .with_padding_bottom(4.)
-            .with_padding_left(8.)
-            .with_padding_right(8.)
-            .with_margin_bottom(6.)
-            .finish();
+                        );
+                    }
+                }
+            }
+
+            let block = Container::new(block_col.finish())
+                .with_background(bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                .with_padding_top(4.)
+                .with_padding_bottom(4.)
+                .with_padding_left(8.)
+                .with_padding_right(8.)
+                .with_margin_bottom(6.)
+                .finish();
             msg_col.add_child(block);
         }
-        // Streaming indicator
         if self.omw_is_streaming {
             let indicator = Container::new(
                 Text::new_inline("▸ AI — streaming...", font, BODY_FONT_SIZE)
-                    .with_color(dim_color)
-                    .finish(),
+                    .with_color(dim_color).finish(),
             )
-            .with_background(ai_bg)
+            .with_background(theme.surface_2())
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_padding(warpui::elements::Padding::uniform(4.))
+            .with_padding(Padding::uniform(4.))
             .with_padding_left(8.)
             .with_margin_bottom(6.)
             .finish();
             msg_col.add_child(indicator);
         }
-        // Empty state
         if self.omw_messages.is_empty() && !self.omw_is_streaming {
             let empty = Text::new_inline("Type and press Enter to submit.", font, BODY_FONT_SIZE)
-                .with_color(dim_color)
-                .finish();
+                .with_color(dim_color).finish();
             msg_col.add_child(Container::new(empty).with_margin_top(20.).finish());
         }
 
         let mut col = Flex::column();
         col.add_child(header);
-        col.add_child(shortcuts);
         col.add_child(
-            Container::new(Shrinkable::new(1., msg_col.finish()).finish())
-                .with_margin_top(8.)
-                .finish(),
+            Container::new(
+                ClippedScrollable::vertical(
+                    self.omw_scroll_state.clone(),
+                    msg_col.finish(),
+                    ScrollbarWidth::None,
+                    dim_color.into(),
+                    text_color.into(),
+                    Fill::None,
+                ).finish(),
+            ).with_margin_top(8.).finish(),
         );
         col.add_child(
             ConstrainedBox::new(self.render_editor())
-                .with_max_width(1200.)
-                .finish(),
+                .with_max_width(1200.).finish(),
         );
-        let panel_content =
-            Align::new(Container::new(col.finish()).finish()).finish();
-        Resizable::new(
-            self.resizable_state_handle.clone(),
-            panel_content,
-        )
-        .on_resize(move |ctx, _| ctx.notify())
-        .with_dragbar_side(DragBarSide::Left)
-        .with_bounds_callback(Box::new(|window_bounds| {
-            (
-                MIN_PANEL_WIDTH,
-                (window_bounds.x() - MIN_REMAINING_WINDOW_SIZE).max(MIN_PANEL_WIDTH),
-            )
-        }))
-        .finish()
+        let panel_content = Align::new(Container::new(col.finish()).finish()).finish();
+        Resizable::new(self.resizable_state_handle.clone(), panel_content)
+            .on_resize(move |ctx, _| ctx.notify())
+            .with_dragbar_side(DragBarSide::Left)
+            .with_bounds_callback(Box::new(|window_bounds| {
+                (MIN_PANEL_WIDTH, (window_bounds.x() - MIN_REMAINING_WINDOW_SIZE).max(MIN_PANEL_WIDTH))
+            })).finish()
     }
     fn on_active_session_change(
         &mut self,
@@ -1619,9 +1671,22 @@ impl TypedActionView for AIAssistantPanelView {
             }
             #[cfg(feature = "omw_local")]
             OmwClearHistory => {
-                self.omw_messages.clear();
-                self.save_chat_history();
-                ctx.notify();
+                if self.omw_messages.is_empty() {
+                    return;
+                }
+                // Double-tap: first press warns, second press clears
+                if !self.omw_messages.last().map_or(false, |m| m.role == "_confirm") {
+                    self.omw_messages.push(OmwChatMessage {
+                        role: "_confirm".into(),
+                        content: "Press ctrl-alt-x again to clear all messages".into(),
+                    });
+                    self.save_chat_history();
+                    ctx.notify();
+                } else {
+                    self.omw_messages.clear();
+                    self.save_chat_history();
+                    ctx.notify();
+                }
             }
         }
     }
