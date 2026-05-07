@@ -166,6 +166,7 @@ struct OmwProviderInfo {
 }
 
 #[cfg(feature = "omw_local")]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct OmwChatMessage {
     role: String,
     content: String,
@@ -187,6 +188,8 @@ pub enum AIAssistantAction {
     OmwCycleProvider,
     #[cfg(feature = "omw_local")]
     OmwCycleModel,
+    #[cfg(feature = "omw_local")]
+    OmwClearHistory,
 }
 
 pub fn init(app: &mut AppContext) {
@@ -246,6 +249,13 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding("ctrl-alt-m"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_clear_history",
+            "Clear chat history",
+            AIAssistantAction::OmwClearHistory,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-alt-x"),
     ]);
 }
 
@@ -367,7 +377,7 @@ impl AIAssistantPanelView {
             panel.omw_selected_provider = None;
             panel.omw_selected_model = None;
             panel.omw_available_models = Vec::new();
-            panel.omw_messages = Vec::new();
+            panel.omw_messages = Self::load_chat_history();
             panel.omw_is_streaming = false;
 
             let http = panel.omw_http.clone();
@@ -446,6 +456,7 @@ impl AIAssistantPanelView {
         self.editor.update(ctx, |editor, ctx| {
             editor.clear_buffer_and_reset_undo_stack(ctx);
         });
+        self.save_chat_history();
         ctx.notify();
 
         // async_channel bridge: HTTP task sends deltas → spawn_stream_local
@@ -544,9 +555,50 @@ impl AIAssistantPanelView {
             },
             |this, ctx| {
                 this.omw_is_streaming = false;
+                this.save_chat_history();
                 ctx.notify();
             },
         );
+    }
+
+    /// Save chat history to `~/.config/omw/chat_history.json`.
+    #[cfg(feature = "omw_local")]
+    fn save_chat_history(&self) {
+        let path = match Self::chat_history_path() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&self.omw_messages) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    /// Load chat history from disk. Returns empty vec on any error.
+    #[cfg(feature = "omw_local")]
+    fn load_chat_history() -> Vec<OmwChatMessage> {
+        let path = match Self::chat_history_path() {
+            Some(p) => p,
+            None => return vec![],
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => vec![],
+        }
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn chat_history_path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))?;
+        let p = std::path::PathBuf::from(home)
+            .join(".config")
+            .join("omw")
+            .join("chat_history.json");
+        // Ensure directory exists
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Some(p)
     }
 
     /// Known models per provider kind for model cycling.
@@ -582,7 +634,7 @@ impl AIAssistantPanelView {
 
         // ── Header ──
         let header_text = format!(
-            "omw AI — {} | model: {}\n[ctrl-alt-p] provider  [ctrl-alt-m] model\n\n",
+            "omw AI — {} | model: {}\n[ctrl-alt-p] provider  [ctrl-alt-m] model  [ctrl-alt-x] clear\n\n",
             provider_label, model_label
         );
 
@@ -1497,6 +1549,12 @@ impl TypedActionView for AIAssistantPanelView {
                     self.omw_selected_model = Some(self.omw_available_models[next].clone());
                     ctx.notify();
                 }
+            }
+            #[cfg(feature = "omw_local")]
+            OmwClearHistory => {
+                self.omw_messages.clear();
+                self.save_chat_history();
+                ctx.notify();
             }
         }
     }
