@@ -627,70 +627,123 @@ impl AIAssistantPanelView {
     }
 
     #[cfg(feature = "omw_local")]
+    #[cfg(feature = "omw_local")]
     fn render_omw_chat(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
+        let font = appearance.ui_font_family();
         let provider_label = self.omw_selected_provider.as_deref().unwrap_or("(no provider)");
         let model_label = self.omw_selected_model.as_deref().unwrap_or("(default)");
+        let text_color = theme.active_ui_text_color(); // Fill
+        let dim_color = blended_colors::text_sub(theme, theme.surface_2());
+        let ai_bg = theme.surface_2();
+        let user_bg = theme.surface_3();
 
-        // ── Header ──
-        let header_text = format!(
-            "omw AI — {} | model: {}\n[ctrl-alt-p] provider  [ctrl-alt-m] model  [ctrl-alt-x] clear\n\n",
-            provider_label, model_label
-        );
+        // ── Header row ──
+        let header = Container::new(
+            Flex::row()
+                .with_child(
+                    Text::new_inline(
+                        format!("omw AI — {} | {}", provider_label, model_label),
+                        font,
+                        BODY_FONT_SIZE,
+                    )
+                    .with_color(blended_colors::text_sub(theme, theme.surface_2()))
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_padding_bottom(4.)
+        .finish();
 
-        // ── Messages with labels ──
-        let mut msg_text = header_text;
+        let shortcuts = Text::new_inline(
+            "ctrl-alt-p:provider  ctrl-alt-m:model  ctrl-alt-x:clear",
+            font,
+            10.,
+        )
+        .with_color(dim_color)
+        .finish();
+
+        // ── Messages ──
+        let mut msg_col = Flex::column();
         for m in &self.omw_messages {
-            match m.role.as_str() {
-                "user" => msg_text.push_str(&format!("▸ You\n{}\n\n", m.content)),
-                "assistant" => msg_text.push_str(&format!("▸ AI\n{}\n\n", m.content)),
-                other => msg_text.push_str(&format!("▸ {}\n{}\n\n", other, m.content)),
-            }
-        }
-        if self.omw_is_streaming {
-            msg_text.push_str("▸ AI\n...\n");
-        }
-        if self.omw_messages.is_empty() && !self.omw_is_streaming {
-            msg_text.push_str("Type and press Shift+Enter to submit.\n");
-        }
-
-        let text_area = appearance
-            .ui_builder()
-            .wrappable_text(msg_text, true)
-            .with_style(UiComponentStyles {
-                font_family_id: Some(appearance.ui_font_family()),
-                font_size: Some(BODY_FONT_SIZE),
-                font_color: Some(theme.active_ui_text_color().into()),
-                ..Default::default()
-            })
-            .build()
+            let (label, bg) = match m.role.as_str() {
+                "user" => ("▸ You", user_bg),
+                _ => ("▸ AI", ai_bg),
+            };
+            let block = Container::new(
+                Flex::column()
+                    .with_child(
+                        Text::new_inline(label, font, BODY_FONT_SIZE)
+                            .with_style(Properties {
+                                weight: warpui::fonts::Weight::Bold,
+                                ..Default::default()
+                            })
+                            .with_color(blended_colors::text_sub(theme, bg))
+                            .finish(),
+                    )
+                    .with_child(
+                        appearance
+                            .ui_builder()
+                            .wrappable_text(m.content.clone(), true)
+                            .with_style(UiComponentStyles {
+                                font_family_id: Some(font),
+                                font_size: Some(BODY_FONT_SIZE),
+                                font_color: Some(text_color.into()),
+                                ..Default::default()
+                            })
+                            .build()
+                            .finish(),
+                    )
+                    .finish(),
+            )
+            .with_background(bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_padding_top(4.)
+            .with_padding_bottom(4.)
+            .with_padding_left(8.)
+            .with_padding_right(8.)
+            .with_margin_bottom(6.)
             .finish();
+            msg_col.add_child(block);
+        }
+        // Streaming indicator
+        if self.omw_is_streaming {
+            let indicator = Container::new(
+                Text::new_inline("▸ AI — streaming...", font, BODY_FONT_SIZE)
+                    .with_color(dim_color)
+                    .finish(),
+            )
+            .with_background(ai_bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_padding(warpui::elements::Padding::uniform(4.))
+            .with_padding_left(8.)
+            .with_margin_bottom(6.)
+            .finish();
+            msg_col.add_child(indicator);
+        }
+        // Empty state
+        if self.omw_messages.is_empty() && !self.omw_is_streaming {
+            let empty = Text::new_inline("Type and press Enter to submit.", font, BODY_FONT_SIZE)
+                .with_color(dim_color)
+                .finish();
+            msg_col.add_child(Container::new(empty).with_margin_top(20.).finish());
+        }
 
         let mut col = Flex::column();
-        col.add_child(Shrinkable::new(1., text_area).finish());
-        // Editor input
+        col.add_child(header);
+        col.add_child(shortcuts);
+        col.add_child(
+            Container::new(Shrinkable::new(1., msg_col.finish()).finish())
+                .with_margin_top(8.)
+                .finish(),
+        );
         col.add_child(
             ConstrainedBox::new(self.render_editor())
                 .with_max_width(1200.)
                 .finish(),
         );
-        let panel_content =
-            Align::new(Container::new(col.finish()).finish()).finish();
-        Resizable::new(
-            self.resizable_state_handle.clone(),
-            panel_content,
-        )
-        .on_resize(move |ctx, _| ctx.notify())
-        .with_dragbar_side(DragBarSide::Left)
-        .with_bounds_callback(Box::new(|window_bounds| {
-            (
-                MIN_PANEL_WIDTH,
-                (window_bounds.x() - MIN_REMAINING_WINDOW_SIZE).max(MIN_PANEL_WIDTH),
-            )
-        }))
-        .finish()
+        Align::new(Container::new(col.finish()).finish()).finish()
     }
-
     fn on_active_session_change(
         &mut self,
         active_session_handle: ModelHandle<ActiveSession>,
