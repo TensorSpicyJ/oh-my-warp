@@ -706,10 +706,12 @@ impl AIAssistantPanelView {
         // ── Messages ──
         let mut msg_col = Flex::column();
         for m in &self.omw_messages {
-            if m.role == "_confirm" { continue; }
             let is_user = m.role == "user";
-            let label = if is_user { "▸ You" } else { "▸ AI" };
-            let bg = if is_user { theme.surface_3() } else { theme.surface_2() };
+            let (label, bg) = match m.role.as_str() {
+                "user" => ("▸ You", theme.surface_3()),
+                "_confirm" => ("⚠", theme.surface_2()),
+                _ => ("▸ AI", theme.surface_2()),
+            };
 
             let mut block_col = Flex::column();
             block_col.add_child(
