@@ -266,7 +266,7 @@ pub fn init(app: &mut AppContext) {
             AIAssistantAction::OmwClearHistory,
         )
         .with_context_predicate(id!("AIAssistantPanel"))
-        .with_key_binding("ctrl-alt-x"),
+        .with_key_binding("ctrl-alt-backspace"),
     ]);
 }
 
@@ -565,6 +565,11 @@ impl AIAssistantPanelView {
             rx,
             |this, delta, ctx| {
                 if let Some(last) = this.omw_messages.last_mut() {
+                    // Server BufReader::lines() strips \n; restore to preserve
+                    // multi-line content (code blocks, formatted text, etc.).
+                    if !last.content.is_empty() && !last.content.ends_with('\n') {
+                        last.content.push('\n');
+                    }
                     last.content.push_str(&delta);
                     this.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
                     ctx.notify();
@@ -699,7 +704,8 @@ impl AIAssistantPanelView {
         // ── Header ──
         let header = Text::new_inline(
             format!("omw AI — {} [{}/{}] | {} [{}/{}]  [ctrl-alt-x:clear]",
-                provider_label, cur_p, n_providers, model_label, cur_m, n_models),
+                provider_label, cur_p, n_providers, model_label, cur_m, n_models)
+                + "  [ctrl-alt-backspace:clear]",
             font, BODY_FONT_SIZE,
         ).with_color(text_color).finish();
 
@@ -1688,7 +1694,7 @@ impl TypedActionView for AIAssistantPanelView {
                 if !self.omw_messages.last().map_or(false, |m| m.role == "_confirm") {
                     self.omw_messages.push(OmwChatMessage {
                         role: "_confirm".into(),
-                        content: "Press ctrl-alt-x again to clear all messages".into(),
+                        content: "Press ctrl-alt-backspace again to clear all messages".into(),
                     });
                     self.save_chat_history();
                     ctx.notify();
