@@ -92,6 +92,11 @@ pub async fn ask(Json(body): Json<AskRequest>) -> Response {
     if let Ok(path) = std::env::var("PATH") {
         cmd.env("PATH", path);
     }
+    // Tell omw-agent NOT to emit \n between deltas.
+    // When piped, emitDelimiters defaults to true (line 12 of omw-agent.mjs).
+    // We override so the agent writes raw text — internal \n from the LLM
+    // response are preserved, and the server reads the complete text as-is.
+    cmd.env("OMW_NO_DELIMITERS", "1");
     // Windows CSPRNG DLL needs SystemRoot.
     if cfg!(windows) {
         if let Ok(sr) = std::env::var("SystemRoot") {
@@ -117,16 +122,16 @@ pub async fn ask(Json(body): Json<AskRequest>) -> Response {
     let stderr = child.stderr.take().expect("stderr piped");
 
     let stream = async_stream::stream! {
-        use tokio::io::AsyncBufReadExt;
-        let reader = tokio::io::BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.is_empty() { continue; }
-            let event = Event::default().data(line);
+        use tokio::io::AsyncReadExt;
+        // Read the full stdout as one string — agent emits raw text
+        // without BufReader::lines() splitting content on \n.
+        let mut stdout_buf = String::new();
+        let _ = tokio::io::BufReader::new(stdout).read_to_string(&mut stdout_buf).await;
+        if !stdout_buf.is_empty() {
+            let event = Event::default().data(stdout_buf);
             yield Ok::<_, std::convert::Infallible>(event);
         }
         // Read stderr for diagnostics or usage record.
-        use tokio::io::AsyncReadExt;
         let mut err_buf = String::new();
         let _ = tokio::io::BufReader::new(stderr).read_to_string(&mut err_buf).await;
         let status = child.wait().await;

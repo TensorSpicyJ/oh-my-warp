@@ -58,7 +58,11 @@ use warpui::elements::ResizableStateHandle;
 use super::execution_context::WarpAiExecutionContext;
 use super::requests::{Event as RequestsEvent, RequestStatus, Requests};
 use super::transcript::{Transcript, TranscriptEvent};
-use super::utils::{render_prepared_response_button, render_request_limit_info, TranscriptPart};
+use super::utils::{
+    markdown_segments_from_text, render_prepared_response_button, render_request_limit_info,
+    MarkdownSegment, TranscriptPart, TranscriptPartSubType,
+};
+use warpui::elements::FormattedTextElement;
 use super::{
     AskAIType, AI_ASSISTANT_FEATURE_NAME, AI_ASSISTANT_LOGO_COLOR, AI_ASSISTANT_SVG_PATH,
     ASK_AI_ASSISTANT_TEXT, PROMPT_CHARACTER_LIMIT,
@@ -534,6 +538,55 @@ impl AIAssistantPanelView {
 
         // Remove any pending confirm message before pushing new messages.
         self.omw_messages.retain(|m| m.role != "_confirm");
+        // Build conversation context from recent history (last 20 messages)
+        // plus implicit system context (OS, shell, CWD, git).
+        let history_prompt = {
+            let mut system_ctx = String::new();
+            // System identity. 请用中文回复。
+            system_ctx.push_str(&format!(
+                "System: {}\nShell: {}\n请用中文回复。\n",
+                if cfg!(target_os = "windows") { "Windows" } else { "macOS/Linux" },
+                std::env::var("SHELL").unwrap_or_else(|_| "powershell".into()),
+            ));
+            // CWD from the active session.
+            if let Ok(cwd) = std::env::current_dir() {
+                system_ctx.push_str(&format!("CWD: {}\n", cwd.display()));
+            }
+            // Git context (best-effort, non-blocking).
+            if let Ok(out) = std::process::Command::new("git")
+                .args(["branch", "--show-current"])
+                .output()
+            {
+                let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !branch.is_empty() {
+                    system_ctx.push_str(&format!("Git branch: {}\n", branch));
+                }
+            }
+            if let Ok(out) = std::process::Command::new("git")
+                .args(["status", "--short"])
+                .output()
+            {
+                let status = String::from_utf8_lossy(&out.stdout);
+                if !status.trim().is_empty() {
+                    system_ctx.push_str(&format!("Git status:\n{}", status));
+                }
+            }
+
+            let visible: Vec<&OmwChatMessage> = self.omw_messages
+                .iter()
+                .filter(|m| m.role != "_confirm" && !m.content.is_empty())
+                .collect();
+            if visible.is_empty() {
+                format!("{system_ctx}\nUser: {prompt}")
+            } else {
+                let mut ctx = String::from("Previous conversation:\n");
+                for m in visible.iter().rev().take(20).rev() {
+                    let role = if m.role == "user" { "User" } else { "Assistant" };
+                    ctx.push_str(&format!("{}: {}\n", role, m.content));
+                }
+                format!("{system_ctx}\n{ctx}\nUser: {prompt}")
+            }
+        };
         // Push user message + empty assistant placeholder for incremental fill.
         self.omw_messages.push(OmwChatMessage {
             role: "user".to_string(),
@@ -562,7 +615,7 @@ impl AIAssistantPanelView {
             async move {
                 let body = serde_json::json!({
                     "provider": provider,
-                    "prompt": prompt,
+                    "prompt": history_prompt,
                     "model": model_for_req,
                 });
                 let resp = match http
@@ -652,15 +705,10 @@ impl AIAssistantPanelView {
                 match event {
                     OmwStreamEvent::Delta(delta) => {
                         if let Some(last) = this.omw_messages.last_mut() {
-                            // Restore newline between deltas when the incoming
-                            // chunk starts a new line (whitespace-leading or
-                            // empty).  This preserves code-block structure
-                            // without breaking word-level streaming.
-                            if !last.content.is_empty()
-                                && !last.content.ends_with('\n')
-                                && (delta.starts_with(|c: char| c.is_whitespace())
-                                    || delta.is_empty())
-                            {
+                            // Server sends the text with \n restored between
+                            // lines. Concatenate directly — the agent's
+                            // original formatting is preserved.
+                            if !last.content.is_empty() {
                                 last.content.push('\n');
                             }
                             last.content.push_str(&delta);
@@ -928,44 +976,74 @@ impl AIAssistantPanelView {
                     .with_color(text_color).finish(),
             );
 
-            let segments = Self::split_code_segments(&m.content);
-            for seg in &segments {
-                match seg {
-                    CodeSegment::Text(t) => {
-                        if !t.is_empty() {
+            // Render message content with full markdown parsing.
+            let parsed = markdown_segments_from_text(
+                0,
+                TranscriptPartSubType::Answer,
+                &m.content,
+            );
+            if let Some(ref segments) = parsed {
+                for seg in segments {
+                    match seg {
+                        MarkdownSegment::Other {
+                            formatted_text,
+                            highlighted_hyperlink: _,
+                        } => {
                             block_col.add_child(
-                                appearance.ui_builder()
-                                    .wrappable_text(t.clone(), true)
-                                    .with_style(UiComponentStyles {
-                                        font_family_id: Some(font),
-                                        font_size: Some(BODY_FONT_SIZE),
-                                        font_color: Some(text_color.into()),
-                                        ..Default::default()
-                                    }).build().finish(),
+                                FormattedTextElement::new(
+                                    formatted_text.to_owned(),
+                                    BODY_FONT_SIZE,
+                                    font,
+                                    appearance.monospace_font_family(),
+                                    text_color,
+                                    Default::default(),
+                                )
+                                .with_inline_code_properties(
+                                    Some(dim_color),
+                                    Some(theme.surface_3().into_solid()),
+                                )
+                                .finish(),
+                            );
+                        }
+                        MarkdownSegment::CodeBlock {
+                            code,
+                            ..
+                        } => {
+                            block_col.add_child(
+                                Container::new(
+                                    appearance.ui_builder()
+                                        .wrappable_text(code.code.clone(), false)
+                                        .with_style(UiComponentStyles {
+                                            font_family_id: Some(appearance.monospace_font_family()),
+                                            font_size: Some(11.),
+                                            font_color: Some(dim_color.into()),
+                                            ..Default::default()
+                                        }).build().finish(),
+                                )
+                                .with_background(code_bg)
+                                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                                .with_padding(Padding::uniform(4.))
+                                .with_padding_left(8.)
+                                .with_margin_top(2.)
+                                .with_margin_bottom(2.)
+                                .finish(),
                             );
                         }
                     }
-                    CodeSegment::CodeBlock(code) => {
-                        block_col.add_child(
-                            Container::new(
-                                appearance.ui_builder()
-                                    .wrappable_text(code.clone(), false)
-                                    .with_style(UiComponentStyles {
-                                        font_family_id: Some(appearance.monospace_font_family()),
-                                        font_size: Some(11.),
-                                        font_color: Some(dim_color.into()),
-                                        ..Default::default()
-                                    }).build().finish(),
-                            )
-                            .with_background(code_bg)
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-                            .with_padding(Padding::uniform(4.))
-                            .with_padding_left(8.)
-                            .with_margin_top(2.)
-                            .with_margin_bottom(2.)
-                            .finish(),
-                        );
-                    }
+                }
+            } else {
+                // Fallback plain text.
+                if !m.content.is_empty() {
+                    block_col.add_child(
+                        appearance.ui_builder()
+                            .wrappable_text(m.content.clone(), true)
+                            .with_style(UiComponentStyles {
+                                font_family_id: Some(font),
+                                font_size: Some(BODY_FONT_SIZE),
+                                font_color: Some(text_color.into()),
+                                ..Default::default()
+                            }).build().finish(),
+                    );
                 }
             }
 
@@ -1080,7 +1158,7 @@ impl AIAssistantPanelView {
     fn format_as_code_block(&self, content: &str) -> String {
         // Intentionally choose a language that won't be interpreted as a shell language
         // i.e. (*sh)
-        format!("```warp\n{}\n```", content.trim())
+        format!("```shell\n{}\n```", content.trim())
     }
 
     // TODO: reconsider if we should be doing all the formatting in here as opposed
@@ -1092,7 +1170,7 @@ impl AIAssistantPanelView {
                 populate_input_box,
             } => {
                 if *populate_input_box {
-                    let prefix = "Explain the following:\n";
+                    let prefix = "";
                     let code_block_formatting_len = self.format_as_code_block("").len();
                     let truncated =
                         if text.chars().count() + prefix.len() + code_block_formatting_len
@@ -1237,17 +1315,20 @@ impl AIAssistantPanelView {
                     return;
                 }
                 #[cfg(feature = "omw_local")]
-                if self.is_omw_placeholder {
+                {
                     self.omw_submit_prompt(buffer_text, ctx);
                     ctx.notify();
                     return;
                 }
-                if !self.is_prompt_too_long(buffer_text.as_str()) {
-                    self.issue_request(buffer_text, ctx);
-                } else {
-                    send_telemetry_from_ctx!(TelemetryEvent::WarpAICharacterLimitExceeded, ctx);
+                #[cfg(not(feature = "omw_local"))]
+                {
+                    if !self.is_prompt_too_long(buffer_text.as_str()) {
+                        self.issue_request(buffer_text, ctx);
+                    } else {
+                        send_telemetry_from_ctx!(TelemetryEvent::WarpAICharacterLimitExceeded, ctx);
+                    }
+                    ctx.notify();
                 }
-                ctx.notify();
             }
             EditorEvent::Edited(_) => {
                 // Force a re-render so we can show the character limit warning.

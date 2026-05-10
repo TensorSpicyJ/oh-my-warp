@@ -16228,7 +16228,9 @@ impl Workspace {
     }
 
     fn ask_ai_assistant(&mut self, ask_type: &AskAIType, ctx: &mut ViewContext<Self>) {
-        if !ChannelState::official_cloud_services_enabled() {
+        // omw_local: allow Ask AI with terminal context even though cloud
+        // services are stripped — the panel routes through omw-server.
+        if !ChannelState::official_cloud_services_enabled() && !cfg!(feature = "omw_local") {
             return;
         }
 
