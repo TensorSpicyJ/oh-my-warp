@@ -577,6 +577,14 @@ async fn bring_up_daemon(
             pinned_origins.push(ip_origin.clone());
             pair_origin = ip_origin;
         }
+        // Tailscale Funnel exposes the daemon via HTTPS on the MagicDNS
+        // hostname without a port.  Phone browsers connecting through
+        // Funnel need this origin in the pinned set so the WS upgrade
+        // isn't rejected as origin_mismatch.
+        if let Some(ref dns) = ts.local_hostname {
+            let funnel_origin = format!("https://{dns}");
+            pinned_origins.push(funnel_origin);
+        }
     }
     let pair_url = format!("{pair_origin}/pair?t={}", token.to_base32());
 

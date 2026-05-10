@@ -10,7 +10,7 @@ members = [
     "crates/omw-policy",
     "crates/omw-pty",
     "crates/omw-remote",
-    "crates/omw-server",
+    "crates/omw-server", "omw-store-key",
 ]
 
 [workspace.package]

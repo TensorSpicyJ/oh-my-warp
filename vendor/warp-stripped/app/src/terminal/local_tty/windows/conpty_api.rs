@@ -2,16 +2,10 @@ use std::mem::transmute;
 use std::path::Path;
 use thiserror::Error;
 use warp_util::path::TargetDirError;
-use windows::core::{s, HRESULT, HSTRING, PCWSTR};
+use windows::core::{s, w, HRESULT, PCSTR, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{COORD, HPCON};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-
-const CREATE_PSUEDOCONSOLE_FN_NAME: &str = "CreatePsuedoConsole";
-const RESIZE_PSUEDOCONSOLE_FN_NAME: &str = "ResizePsuedoConsole";
-const CLOSE_PSUEDOCONSOLE_FN_NAME: &str = "ClosePsuedoConsole";
-const SHOW_HIDE_PSUEDOCONSOLE_FN_NAME: &str = "ShowHidePseudoConsole";
-const RELEASE_PSUEDOCONSOLE_FN_NAME: &str = "ReleasePseudoConsole";
 
 type CreatePseudoConsoleFn =
     unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
@@ -21,15 +15,10 @@ type ShowHidePseudoConsoleFn = unsafe extern "system" fn(HPCON, bool) -> HRESULT
 type ReleasePseudoConsoleFn = unsafe extern "system" fn(HPCON) -> HRESULT;
 
 pub struct ConptyApi {
-    /// Function pointer for CreatePseudoConsole.
     create: CreatePseudoConsoleFn,
-    /// Function pointer for ResizePseudoConsole.
     resize: ResizePseudoConsoleFn,
-    /// Function pointer for ClosePseudoConsole.
     close: ClosePseudoConsoleFn,
-    /// Function pointer for ShowHidePseudoConsole.
-    show_hide: ShowHidePseudoConsoleFn,
-    /// Function pointer for ReleasePseudoConsole.
+    show_hide: Option<ShowHidePseudoConsoleFn>,
     release: ReleasePseudoConsoleFn,
 }
 
@@ -53,12 +42,26 @@ impl ConptyApi {
     pub(super) unsafe fn load() -> Result<Self, ConptyApiError> {
         type LoadedFn = unsafe extern "system" fn() -> isize;
 
-        let hstring = HSTRING::from("conpty.dll");
-        let dll_file_path = PCWSTR::from_raw(hstring.as_ptr());
-
-        let conpty_module = match LoadLibraryW(dll_file_path) {
-            Ok(conpty_module) => conpty_module,
-            Err(windows_error) => {
+        // On Windows 10 1903+ the ConPTY functions live in conpty.dll with
+        // "Conpty" prefixed names. On Windows 11 they were moved into
+        // kernel32.dll with plain names (no "Conpty" prefix) and the
+        // standalone conpty.dll no longer exists. Try conpty.dll first,
+        // then kernel32.dll.
+        let mut conpty_module = None;
+        let mut last_error = None;
+        for dll in [w!("conpty.dll"), w!("kernel32.dll")] {
+            match LoadLibraryW(dll) {
+                Ok(m) => {
+                    conpty_module = Some(m);
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        let conpty_module = match conpty_module {
+            Some(m) => m,
+            None => {
+                let windows_error = last_error.unwrap();
                 let dll_file_exists = Path::new("./conpty.dll").try_exists();
                 return Err(ConptyApiError::LoadLibraryFailed {
                     windows_error,
@@ -66,47 +69,41 @@ impl ConptyApi {
                 });
             }
         };
-        let Some(create) = GetProcAddress(conpty_module, s!("CreatePseudoConsole"))
-            .map(|create_fn| transmute::<LoadedFn, CreatePseudoConsoleFn>(create_fn))
-        else {
-            return Err(ConptyApiError::GetProcAddressFailed {
-                fn_name: CREATE_PSUEDOCONSOLE_FN_NAME.to_string(),
-            });
-        };
-        let Some(resize) = GetProcAddress(conpty_module, s!("ResizePseudoConsole"))
-            .map(|resize_fn| transmute::<LoadedFn, ResizePseudoConsoleFn>(resize_fn))
-        else {
-            return Err(ConptyApiError::GetProcAddressFailed {
-                fn_name: RESIZE_PSUEDOCONSOLE_FN_NAME.to_string(),
-            });
-        };
-        let Some(close) = GetProcAddress(conpty_module, s!("ClosePseudoConsole"))
-            .map(|close_fn| transmute::<LoadedFn, ClosePseudoConsoleFn>(close_fn))
-        else {
-            return Err(ConptyApiError::GetProcAddressFailed {
-                fn_name: CLOSE_PSUEDOCONSOLE_FN_NAME.to_string(),
-            });
-        };
-        let Some(show_hide) = GetProcAddress(conpty_module, s!("ConptyShowHidePseudoConsole"))
-            .map(|show_hide_fn| transmute::<LoadedFn, ShowHidePseudoConsoleFn>(show_hide_fn))
-        else {
-            return Err(ConptyApiError::GetProcAddressFailed {
-                fn_name: SHOW_HIDE_PSUEDOCONSOLE_FN_NAME.to_string(),
-            });
-        };
-        let Some(release) = GetProcAddress(conpty_module, s!("ConptyReleasePseudoConsole"))
-            .map(|release_fn| transmute::<LoadedFn, ReleasePseudoConsoleFn>(release_fn))
-        else {
-            return Err(ConptyApiError::GetProcAddressFailed {
-                fn_name: RELEASE_PSUEDOCONSOLE_FN_NAME.to_string(),
-            });
-        };
+
+        // Try plain name (kernel32) first, then Conpty-prefixed name (conpty.dll).
+        unsafe fn load_proc(
+            module: windows::Win32::Foundation::HMODULE,
+            plain: PCSTR,
+            conpty_prefixed: PCSTR,
+        ) -> Option<unsafe extern "system" fn() -> isize> {
+            GetProcAddress(module, plain).or_else(|| GetProcAddress(module, conpty_prefixed))
+        }
+
+        let create = load_proc(conpty_module, s!("CreatePseudoConsole"), s!("ConptyCreatePseudoConsole"))
+            .ok_or_else(|| ConptyApiError::GetProcAddressFailed {
+                fn_name: "CreatePseudoConsole".to_string(),
+            })?;
+        let resize = load_proc(conpty_module, s!("ResizePseudoConsole"), s!("ConptyResizePseudoConsole"))
+            .ok_or_else(|| ConptyApiError::GetProcAddressFailed {
+                fn_name: "ResizePseudoConsole".to_string(),
+            })?;
+        let close = load_proc(conpty_module, s!("ClosePseudoConsole"), s!("ConptyClosePseudoConsole"))
+            .ok_or_else(|| ConptyApiError::GetProcAddressFailed {
+                fn_name: "ClosePseudoConsole".to_string(),
+            })?;
+        // ShowHidePseudoConsole is optional — not present on all Windows 11 builds.
+        let show_hide = load_proc(conpty_module, s!("ShowHidePseudoConsole"), s!("ConptyShowHidePseudoConsole"));
+        let release = load_proc(conpty_module, s!("ReleasePseudoConsole"), s!("ConptyReleasePseudoConsole"))
+            .ok_or_else(|| ConptyApiError::GetProcAddressFailed {
+                fn_name: "ReleasePseudoConsole".to_string(),
+            })?;
+
         Ok(ConptyApi {
-            create,
-            resize,
-            close,
-            show_hide,
-            release,
+            create: transmute::<LoadedFn, CreatePseudoConsoleFn>(create),
+            resize: transmute::<LoadedFn, ResizePseudoConsoleFn>(resize),
+            close: transmute::<LoadedFn, ClosePseudoConsoleFn>(close),
+            show_hide: show_hide.map(|f| transmute::<LoadedFn, ShowHidePseudoConsoleFn>(f)),
+            release: transmute::<LoadedFn, ReleasePseudoConsoleFn>(release),
         })
     }
 
@@ -120,8 +117,6 @@ impl ConptyApi {
         let result = (self.create)(size, pipe, pipe, flags, &mut pty_handle)
             .ok()
             .map(|_| pty_handle);
-        // Explicitly free our end of the pipe, giving the pseudoconsole sole
-        // ownership of it.
         windows::core::Free::free(&mut pipe);
         result
     }
@@ -143,7 +138,11 @@ impl ConptyApi {
         pty_handle: HPCON,
         visible: bool,
     ) -> windows::core::Result<()> {
-        (self.show_hide)(pty_handle, visible).ok()
+        if let Some(f) = &self.show_hide {
+            f(pty_handle, visible).ok()
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) unsafe fn release(&self, pty_handle: HPCON) -> windows::core::Result<()> {

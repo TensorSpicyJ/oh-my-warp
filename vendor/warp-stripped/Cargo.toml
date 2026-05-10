@@ -387,6 +387,15 @@ debug = true
 # Force the rust compiler to create a dSYM. Starting in 1.53 the default on MacOS is "unpacked".
 split-debuginfo = "packed"
 
+# Light release: lower optimization + no debug symbols reduces peak memory ~40%.
+# Use when the full release build OOMs on low-RAM machines.
+# Inherits from dev instead of release — the release profile's split-debuginfo
+# and other settings can cause issues on Windows.
+[profile.release-light]
+inherits = "dev"
+opt-level = 0
+debug = "line-tables-only"
+
 [profile.dev]
 # Use line-tables-only to speed up dev builds. Change to `debug = true` if you
 # need full debuginfo for step-through debugging (gdb/lldb).

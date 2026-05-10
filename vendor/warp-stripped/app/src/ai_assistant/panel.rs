@@ -105,6 +105,8 @@ struct MouseStateHandles {
     script_zero_state_prompt: MouseStateHandle,
     git_zero_state_prompt: MouseStateHandle,
     files_zero_state_prompt: MouseStateHandle,
+    #[cfg(feature = "omw_local")]
+    omw_remote_button: MouseStateHandle,
 }
 
 pub enum AIAssistantPanelEvent {
@@ -156,6 +158,10 @@ pub struct AIAssistantPanelView {
     #[cfg(feature = "omw_local")]
     omw_messages: Vec<OmwChatMessage>,
     #[cfg(feature = "omw_local")]
+    omw_all_sessions: Vec<Vec<OmwChatMessage>>,
+    #[cfg(feature = "omw_local")]
+    omw_active_idx: usize,
+    #[cfg(feature = "omw_local")]
     omw_is_streaming: bool,
     #[cfg(feature = "omw_local")]
     omw_scroll_state: ClippedScrollStateHandle,
@@ -177,10 +183,33 @@ enum CodeSegment {
 }
 
 #[cfg(feature = "omw_local")]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct OmwUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+#[cfg(feature = "omw_local")]
+enum OmwStreamEvent {
+    Delta(String),
+    Usage(OmwUsage),
+}
+
+#[cfg(feature = "omw_local")]
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct OmwChatMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    usage: Option<OmwUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +230,14 @@ pub enum AIAssistantAction {
     OmwCycleModel,
     #[cfg(feature = "omw_local")]
     OmwClearHistory,
+    #[cfg(feature = "omw_local")]
+    OmwNewSession,
+    #[cfg(feature = "omw_local")]
+    OmwPrevSession,
+    #[cfg(feature = "omw_local")]
+    OmwNextSession,
+    #[cfg(feature = "omw_local")]
+    OmwToggleRemote,
 }
 
 pub fn init(app: &mut AppContext) {
@@ -244,8 +281,7 @@ pub fn init(app: &mut AppContext) {
             "Submit prompt",
             AIAssistantAction::OmwSubmitPrompt,
         )
-        .with_context_predicate(id!("AIAssistantPanel"))
-        .with_key_binding("shift-enter"),
+        .with_context_predicate(id!("AIAssistantPanel")),
         EditableBinding::new(
             "ai_assistant_panel:omw_cycle_provider",
             "Cycle AI provider",
@@ -267,6 +303,34 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding("ctrl-alt-backspace"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_new_session",
+            "New chat session",
+            AIAssistantAction::OmwNewSession,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-alt-n"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_prev_session",
+            "Previous chat session",
+            AIAssistantAction::OmwPrevSession,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-alt-left"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_next_session",
+            "Next chat session",
+            AIAssistantAction::OmwNextSession,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-alt-right"),
+        EditableBinding::new(
+            "ai_assistant_panel:omw_toggle_remote",
+            "Toggle phone pairing (remote control)",
+            AIAssistantAction::OmwToggleRemote,
+        )
+        .with_context_predicate(id!("AIAssistantPanel"))
+        .with_key_binding("ctrl-alt-r"),
     ]);
 }
 
@@ -360,6 +424,10 @@ impl AIAssistantPanelView {
             #[cfg(feature = "omw_local")]
             omw_messages: Vec::new(),
             #[cfg(feature = "omw_local")]
+            omw_all_sessions: Vec::new(),
+            #[cfg(feature = "omw_local")]
+            omw_active_idx: 0,
+            #[cfg(feature = "omw_local")]
             omw_is_streaming: false,
             #[cfg(feature = "omw_local")]
             omw_scroll_state: Default::default(),
@@ -390,7 +458,13 @@ impl AIAssistantPanelView {
             panel.omw_selected_provider = None;
             panel.omw_selected_model = None;
             panel.omw_available_models = Vec::new();
-            panel.omw_messages = Self::load_chat_history();
+            let (sessions, active_idx) = Self::load_sessions();
+            panel.omw_all_sessions = sessions;
+            panel.omw_active_idx = active_idx;
+            panel.omw_messages = panel.omw_all_sessions
+                .get(panel.omw_active_idx)
+                .cloned()
+                .unwrap_or_default();
             panel.omw_is_streaming = false;
             panel.omw_scroll_state = Default::default();
 
@@ -452,6 +526,7 @@ impl AIAssistantPanelView {
                     role: "system".to_string(),
                     content: "No provider configured. Run: omw provider add <name> --kind openai --key <key>"
                         .to_string(),
+                    usage: None,
                 });
                 return;
             }
@@ -463,21 +538,23 @@ impl AIAssistantPanelView {
         self.omw_messages.push(OmwChatMessage {
             role: "user".to_string(),
             content: prompt.clone(),
+            usage: None,
         });
         self.omw_messages.push(OmwChatMessage {
             role: "assistant".to_string(),
             content: String::new(),
+            usage: None,
         });
         self.omw_is_streaming = true;
         self.editor.update(ctx, |editor, ctx| {
             editor.clear_buffer_and_reset_undo_stack(ctx);
         });
-        self.save_chat_history();
+        self.save_sessions();
         ctx.notify();
 
         // async_channel bridge: HTTP task sends deltas → spawn_stream_local
         // appends them on the main thread and re-renders incrementally.
-        let (tx, rx) = async_channel::unbounded::<String>();
+        let (tx, rx) = async_channel::unbounded::<OmwStreamEvent>();
         let http = self.omw_http.clone();
         let model_for_req = self.omw_selected_model.clone();
 
@@ -497,13 +574,13 @@ impl AIAssistantPanelView {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = tx.send(format!("[Connection error: {}]", e)).await;
+                        let _ = tx.send(OmwStreamEvent::Delta(format!("[Connection error: {}]", e))).await;
                         return;
                     }
                 };
                 if !resp.status().is_success() {
                     let _ = tx
-                        .send(format!("[Server returned HTTP {}]", resp.status()))
+                        .send(OmwStreamEvent::Delta(format!("[Server returned HTTP {}]", resp.status())))
                         .await;
                     return;
                 }
@@ -516,7 +593,7 @@ impl AIAssistantPanelView {
                         Ok(b) => b,
                         Err(e) => {
                             let _ = tx
-                                .send(format!("\n[Stream error: {}]", e))
+                                .send(OmwStreamEvent::Delta(format!("\n[Stream error: {}]", e)))
                                 .await;
                             break;
                         }
@@ -539,17 +616,25 @@ impl AIAssistantPanelView {
                                 if let Some(delta) =
                                     val.get("delta").and_then(|v| v.as_str())
                                 {
-                                    let _ = tx.send(delta.to_string()).await;
+                                    let _ = tx.send(OmwStreamEvent::Delta(delta.to_string())).await;
                                 } else if let Some(err) =
                                     val.get("error").and_then(|v| v.as_str())
                                 {
                                     let _ = tx
-                                        .send(format!("\n[Error: {}]", err))
+                                        .send(OmwStreamEvent::Delta(format!("\n[Error: {}]", err)))
                                         .await;
+                                } else if val.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                    // stream complete — handled in on_done
+                                } else if val.get("prompt_tokens").or(val.get("total_tokens")).is_some() {
+                                    // Telemetry JSON from agent stderr.
+                                    if let Ok(usage) = serde_json::from_value::<OmwUsage>(val) {
+                                        let _ = tx.send(OmwStreamEvent::Usage(usage)).await;
+                                    }
                                 }
-                                // usage / done events silently consumed
+                                // Other events (provider-specific) silently consumed.
                             } else {
-                                let _ = tx.send(content.to_string()).await;
+                                // Non-JSON SSE data — treat as delta for backward compat.
+                                let _ = tx.send(OmwStreamEvent::Delta(content.to_string())).await;
                             }
                         }
                     }
@@ -563,67 +648,117 @@ impl AIAssistantPanelView {
         // and re-renders immediately.
         ctx.spawn_stream_local(
             rx,
-            |this, delta, ctx| {
-                if let Some(last) = this.omw_messages.last_mut() {
-                    // Server BufReader::lines() strips \n; restore to preserve
-                    // multi-line content (code blocks, formatted text, etc.).
-                    if !last.content.is_empty() && !last.content.ends_with('\n') {
-                        last.content.push('\n');
+            |this, event, ctx| {
+                match event {
+                    OmwStreamEvent::Delta(delta) => {
+                        if let Some(last) = this.omw_messages.last_mut() {
+                            // Restore newline between deltas when the incoming
+                            // chunk starts a new line (whitespace-leading or
+                            // empty).  This preserves code-block structure
+                            // without breaking word-level streaming.
+                            if !last.content.is_empty()
+                                && !last.content.ends_with('\n')
+                                && (delta.starts_with(|c: char| c.is_whitespace())
+                                    || delta.is_empty())
+                            {
+                                last.content.push('\n');
+                            }
+                            last.content.push_str(&delta);
+                            this.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
+                            ctx.notify();
+                        }
                     }
-                    last.content.push_str(&delta);
-                    this.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
-                    ctx.notify();
+                    OmwStreamEvent::Usage(usage) => {
+                        if let Some(last) = this.omw_messages.last_mut() {
+                            last.usage = Some(usage);
+                            ctx.notify();
+                        }
+                    }
                 }
             },
             |this, ctx| {
                 this.omw_is_streaming = false;
-                this.save_chat_history();
+                this.save_sessions();
                 ctx.notify();
             },
         );
     }
 
-    /// Save chat history to `~/.config/omw/chat_history.json`.
+    /// Save all sessions to `~/.config/omw/sessions.json` and sync in-memory cache.
     #[cfg(feature = "omw_local")]
-    fn save_chat_history(&self) {
-        let path = match Self::chat_history_path() {
+    fn save_sessions(&mut self) {
+        let path = match Self::sessions_path() {
             Some(p) => p,
             None => return,
         };
-        let visible: Vec<&OmwChatMessage> = self.omw_messages.iter()
-            .filter(|m| m.role != "_confirm")
-            .collect();
-        if let Ok(json) = serde_json::to_string_pretty(&visible) {
+        if self.omw_active_idx < self.omw_all_sessions.len() {
+            self.omw_all_sessions[self.omw_active_idx] = self.omw_messages
+                .iter()
+                .filter(|m| m.role != "_confirm")
+                .cloned()
+                .collect();
+        }
+        let payload = serde_json::json!({
+            "active": self.omw_active_idx,
+            "sessions": &self.omw_all_sessions,
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
             let _ = std::fs::write(&path, json);
         }
     }
 
-    /// Load chat history from disk. Returns empty vec on any error.
+    /// Load sessions from disk. Migrates old `chat_history.json` if present.
+    /// Returns (sessions_list, active_index). Always at least one session.
     #[cfg(feature = "omw_local")]
-    fn load_chat_history() -> Vec<OmwChatMessage> {
-        let path = match Self::chat_history_path() {
-            Some(p) => p,
-            None => return vec![],
+    fn load_sessions() -> (Vec<Vec<OmwChatMessage>>, usize) {
+        let omw_dir = match Self::omw_dir() {
+            Some(d) => d,
+            None => return (vec![vec![]], 0),
         };
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-            Err(_) => vec![],
+        let _ = std::fs::create_dir_all(&omw_dir);
+
+        let sessions_path = omw_dir.join("sessions.json");
+        if let Ok(raw) = std::fs::read_to_string(&sessions_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let sessions: Vec<Vec<OmwChatMessage>> = val["sessions"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|v| serde_json::from_value::<Vec<OmwChatMessage>>(v.clone()).unwrap_or_default())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let active: usize = val["active"].as_u64().map(|n| n as usize).unwrap_or(0);
+                let active = if active < sessions.len() { active } else { 0 };
+                if !sessions.is_empty() {
+                    return (sessions, active);
+                }
+            }
         }
+
+        // Migration: load old chat_history.json flat array into a single session.
+        let chat_path = omw_dir.join("chat_history.json");
+        if let Ok(raw) = std::fs::read_to_string(&chat_path) {
+            if let Ok(msgs) = serde_json::from_str::<Vec<OmwChatMessage>>(&raw) {
+                if !msgs.is_empty() {
+                    return (vec![msgs], 0);
+                }
+            }
+        }
+
+        (vec![vec![]], 0)
     }
 
     #[cfg(feature = "omw_local")]
-    fn chat_history_path() -> Option<std::path::PathBuf> {
+    fn omw_dir() -> Option<std::path::PathBuf> {
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))?;
-        let p = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("omw")
-            .join("chat_history.json");
-        // Ensure directory exists
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        Some(p)
+        Some(std::path::PathBuf::from(home).join(".config").join("omw"))
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn sessions_path() -> Option<std::path::PathBuf> {
+        Self::omw_dir().map(|d| d.join("sessions.json"))
     }
 
     /// Split message content into text and code-block segments on ``` fences.
@@ -657,6 +792,16 @@ impl AIAssistantPanelView {
         out
     }
 
+    /// Format a token count for compact display.
+    #[cfg(feature = "omw_local")]
+    fn format_tokens(n: u32) -> String {
+        if n >= 1000 {
+            format!("{:.1}k", n as f64 / 1000.0)
+        } else {
+            n.to_string()
+        }
+    }
+
     /// Known models per provider kind for model cycling.
     #[cfg(feature = "omw_local")]
     fn models_for_kind(kind: &str) -> Vec<String> {
@@ -683,7 +828,6 @@ impl AIAssistantPanelView {
     }
 
     #[cfg(feature = "omw_local")]
-    #[cfg(feature = "omw_local")]
     fn render_omw_chat(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
@@ -703,16 +847,74 @@ impl AIAssistantPanelView {
 
         // ── Header ──
         let header = Text::new_inline(
-            format!("omw AI — {} [{}/{}] | {} [{}/{}]  [ctrl-alt-x:clear]",
-                provider_label, cur_p, n_providers, model_label, cur_m, n_models)
-                + "  [ctrl-alt-backspace:clear]",
+            format!("omw AI — {} [{}/{}] | {} [{}/{}]  [ctrl-n:new ctrl-left/right:nav ctrl-backspace:clear]",
+                provider_label, cur_p, n_providers, model_label, cur_m, n_models),
             font, BODY_FONT_SIZE,
         ).with_color(text_color).finish();
+
+        // ── Remote control button ──
+        let remote_btn = {
+            let status = crate::omw::OmwRemoteState::shared().status();
+            let label = match &status {
+                crate::omw::OmwRemoteStatus::Stopped => "Phone: Start",
+                crate::omw::OmwRemoteStatus::Starting => "Phone: Starting...",
+                crate::omw::OmwRemoteStatus::Running { .. } => "Phone: Running",
+                crate::omw::OmwRemoteStatus::Failed { .. } => "Phone: Retry",
+            };
+            appearance.ui_builder()
+                .button_with_custom_styles(
+                    ButtonVariant::Secondary,
+                    self.mouse_state_handles.omw_remote_button.clone(),
+                    UiComponentStyles::default(),
+                    None, None, None,
+                )
+                .with_text_label(label.to_owned())
+                .build()
+                .on_click(|ctx, _, _| ctx.dispatch_typed_action(AIAssistantAction::OmwToggleRemote))
+                .with_cursor(Cursor::PointingHand)
+                .finish()
+        };
+
+        // ── Session tabs ──
+        let n_sessions = self.omw_all_sessions.len();
+        let mut tabs_row = Flex::row();
+        for i in 0..n_sessions {
+            let title = self.session_title(i);
+            let is_active = i == self.omw_active_idx;
+            let tab_bg = if is_active { theme.surface_3() } else { theme.surface_1() };
+            let tab_text_color = text_color;
+            let tab_text = format!("{}. {}", i + 1, title);
+            tabs_row.add_child(
+                Container::new(
+                    Text::new_inline(tab_text, font, 11.)
+                        .with_color(tab_text_color).finish(),
+                )
+                .with_background(tab_bg)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+                .with_padding_top(2.).with_padding_bottom(2.)
+                .with_padding_left(6.).with_padding_right(6.)
+                .with_margin_right(4.)
+                .finish(),
+            );
+        }
+        tabs_row.add_child(
+            Container::new(
+                Text::new_inline("+", font, 11.)
+                    .with_color(dim_color).finish(),
+            )
+            .with_background(theme.surface_1())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+            .with_padding_top(2.).with_padding_bottom(2.)
+            .with_padding_left(6.).with_padding_right(6.)
+            .finish(),
+        );
+        let tabs_bar = Container::new(tabs_row.finish())
+            .with_margin_top(4.).with_margin_bottom(2.)
+            .finish();
 
         // ── Messages ──
         let mut msg_col = Flex::column();
         for m in &self.omw_messages {
-            let is_user = m.role == "user";
             let (label, bg) = match m.role.as_str() {
                 "user" => ("▸ You", theme.surface_3()),
                 "_confirm" => ("⚠", theme.surface_2()),
@@ -767,6 +969,23 @@ impl AIAssistantPanelView {
                 }
             }
 
+            // Show per-message token usage if available.
+            if let Some(ref usage) = m.usage {
+                let usage_line = format!(
+                    "↑{} ↓{} · {} · {:.1}s",
+                    Self::format_tokens(usage.prompt_tokens),
+                    Self::format_tokens(usage.completion_tokens),
+                    usage.model,
+                    usage.duration_ms as f64 / 1000.0,
+                );
+                block_col.add_child(
+                    Container::new(
+                        Text::new_inline(usage_line, font, 10.)
+                            .with_color(dim_color).finish(),
+                    ).with_margin_top(4.).finish(),
+                );
+            }
+
             let block = Container::new(block_col.finish())
                 .with_background(bg)
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
@@ -799,6 +1018,8 @@ impl AIAssistantPanelView {
 
         let mut col = Flex::column();
         col.add_child(header);
+        col.add_child(remote_btn);
+        col.add_child(tabs_bar);
         col.add_child(
             Shrinkable::new(
                 1.,
@@ -1110,13 +1331,8 @@ impl AIAssistantPanelView {
                 ctx.notify();
             }
             EditorEvent::ShiftEnter => {
-                if self.is_omw_placeholder {
-                    let buffer_text = self.editor.as_ref(ctx).buffer_text(ctx);
-                    if !buffer_text.trim().is_empty() {
-                        self.omw_submit_prompt(buffer_text, ctx);
-                    }
-                    ctx.notify();
-                }
+                // Shift+Enter inserts newline — editor handles it natively.
+                ctx.notify();
             }
             _ => {}
         }
@@ -1280,6 +1496,69 @@ impl AIAssistantPanelView {
     #[cfg(feature = "integration_tests")]
     pub fn editor(&self) -> &ViewHandle<EditorView> {
         &self.editor
+    }
+
+    // ── Session management ──
+    #[cfg(feature = "omw_local")]
+    fn save_current_session(&mut self) {
+        if self.omw_active_idx < self.omw_all_sessions.len() {
+            self.omw_all_sessions[self.omw_active_idx] = self.omw_messages
+                .iter()
+                .filter(|m| m.role != "_confirm")
+                .cloned()
+                .collect();
+        }
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn switch_session(&mut self, idx: usize, ctx: &mut ViewContext<Self>) {
+        if idx >= self.omw_all_sessions.len() {
+            return;
+        }
+        if self.omw_is_streaming {
+            return;
+        }
+        self.save_current_session();
+        self.omw_active_idx = idx;
+        self.omw_messages = self.omw_all_sessions[idx].clone();
+        self.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
+        self.save_sessions();
+        ctx.notify();
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn new_session(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.omw_is_streaming {
+            return;
+        }
+        self.save_current_session();
+        self.omw_all_sessions.push(Vec::new());
+        self.omw_active_idx = self.omw_all_sessions.len() - 1;
+        self.omw_messages = Vec::new();
+        self.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
+        self.save_sessions();
+        ctx.notify();
+    }
+
+    #[cfg(feature = "omw_local")]
+    fn session_title(&self, idx: usize) -> String {
+        let msgs = self.omw_all_sessions.get(idx)
+            .map(|m| m.as_slice())
+            .unwrap_or(&[]);
+        let first_user = msgs.iter().find(|m| m.role == "user");
+        match first_user {
+            Some(m) => {
+                let t = m.content.lines().next().unwrap_or(&m.content).trim();
+                if t.chars().count() > 40 {
+                    format!("{}…", t.chars().take(40).collect::<String>())
+                } else if t.is_empty() {
+                    "Empty".into()
+                } else {
+                    t.to_string()
+                }
+            }
+            None => "New session".into(),
+        }
     }
 }
 
@@ -1687,6 +1966,9 @@ impl TypedActionView for AIAssistantPanelView {
             }
             #[cfg(feature = "omw_local")]
             OmwClearHistory => {
+                if self.omw_is_streaming {
+                    return;
+                }
                 if self.omw_messages.is_empty() {
                     return;
                 }
@@ -1695,14 +1977,58 @@ impl TypedActionView for AIAssistantPanelView {
                     self.omw_messages.push(OmwChatMessage {
                         role: "_confirm".into(),
                         content: "Press ctrl-alt-backspace again to clear all messages".into(),
+                        usage: None,
                     });
-                    self.save_chat_history();
+                    self.omw_scroll_state.scroll_to(f32::MAX.into_pixels());
+                    self.save_sessions();
                     ctx.notify();
                 } else {
                     self.omw_messages.clear();
-                    self.save_chat_history();
+                    self.save_sessions();
                     ctx.notify();
                 }
+            }
+            #[cfg(feature = "omw_local")]
+            OmwNewSession => {
+                self.new_session(ctx);
+            }
+            #[cfg(feature = "omw_local")]
+            OmwPrevSession => {
+                let n = self.omw_all_sessions.len();
+                if n > 1 {
+                    let idx = if self.omw_active_idx == 0 {
+                        n - 1
+                    } else {
+                        self.omw_active_idx - 1
+                    };
+                    self.switch_session(idx, ctx);
+                }
+            }
+            #[cfg(feature = "omw_local")]
+            OmwNextSession => {
+                let n = self.omw_all_sessions.len();
+                if n > 1 {
+                    let idx = (self.omw_active_idx + 1) % n;
+                    self.switch_session(idx, ctx);
+                }
+            }
+            #[cfg(feature = "omw_local")]
+            OmwToggleRemote => {
+                let state = crate::omw::OmwRemoteState::shared();
+                let was_running = matches!(
+                    state.status(),
+                    crate::omw::OmwRemoteStatus::Running { .. }
+                );
+                if was_running {
+                    let _ = state.stop();
+                } else {
+                    if state.start().is_ok() {
+                        if let crate::omw::OmwRemoteStatus::Running { ref pair_url, .. } = state.status() {
+                            ctx.clipboard().write(ClipboardContent::plain_text(pair_url.clone()));
+                        }
+                    }
+                }
+                ctx.notify();
             }
         }
     }
