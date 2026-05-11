@@ -39,6 +39,7 @@ omw-pty = { path = "../omw-pty" }
 omw-server = { path = "../omw-server" }
 bytes = "1"
 futures-util = "0.3"
+tokio-stream = "0.1"
 include_dir = { version = "0.7", optional = true }
 mime_guess = { version = "2", optional = true }
 

@@ -6,6 +6,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { getPairing, type PairingRecord } from "../lib/storage/idb";
 import { connectPty, type PtyConnection } from "../lib/pty-ws";
+import { connectPtySse } from "../lib/pty-sse";
 import { listSessions } from "../lib/sessions";
 
 type Status = "loading" | "connecting" | "connected" | "disconnected" | "error";
@@ -84,6 +85,9 @@ export default function Terminal() {
 
       setStatus("connecting");
       appendDebug("connectPty start");
+      const isMobile =
+        typeof navigator !== "undefined" &&
+        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
       try {
         connection = await connectPty({
           pairing,
@@ -91,11 +95,30 @@ export default function Terminal() {
           onDebug: appendDebug,
         });
       } catch (e) {
-        appendDebug(`connectPty rejected: ${errStr(e)}`);
-        if (cancelled) return;
-        setErrorMsg(`Failed to connect: ${errStr(e)}`);
-        setStatus("error");
-        return;
+        appendDebug(`connectPty WS failed: ${errStr(e)}`);
+        // Fall back to SSE transport on mobile or when WS is blocked.
+        if (isMobile || `${e}`.includes("ws_error")) {
+          appendDebug("trying SSE fallback...");
+          try {
+            connection = await connectPtySse({
+              pairing,
+              sessionId,
+              onDebug: appendDebug,
+            });
+            appendDebug("SSE connected");
+          } catch (e2) {
+            appendDebug(`SSE also failed: ${errStr(e2)}`);
+            if (cancelled) return;
+            setErrorMsg(`Failed to connect: ${errStr(e2)}`);
+            setStatus("error");
+            return;
+          }
+        } else {
+          if (cancelled) return;
+          setErrorMsg(`Failed to connect: ${errStr(e)}`);
+          setStatus("error");
+          return;
+        }
       }
       appendDebug("connectPty resolved");
       if (cancelled) {

@@ -3,4 +3,5 @@
 
 pub mod host_info;
 pub mod pair_redeem;
+pub mod pty_sse;
 pub mod sessions;

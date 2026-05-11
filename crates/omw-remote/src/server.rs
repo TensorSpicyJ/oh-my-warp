@@ -111,6 +111,14 @@ pub fn make_router(config: ServerConfig) -> axum::Router {
             post(http::sessions::create).get(http::sessions::list),
         )
         .route("/api/v1/sessions/:id", delete(http::sessions::delete))
+        .route(
+            "/api/v1/sessions/:id/pty",
+            get(http::pty_sse::pty_output_handler),
+        )
+        .route(
+            "/api/v1/sessions/:id/pty/input",
+            post(http::pty_sse::pty_input_handler),
+        )
         .route("/ws/v1/pty/:session_id", get(ws_handler))
         .fallback(crate::web_assets::serve_static)
         .with_state(state)
@@ -255,7 +263,7 @@ async fn ws_handler(
 /// Pull the `ct` query parameter out of the raw query string. Returns the
 /// (un-percent-decoded) value if present. Browser-side `pty-ws.ts` sends
 /// base64url which has no characters needing decoding, so we don't bother.
-fn extract_ct_query_param(query: &str) -> Option<&str> {
+pub(crate) fn extract_ct_query_param(query: &str) -> Option<&str> {
     for pair in query.split('&') {
         if let Some(rest) = pair.strip_prefix("ct=") {
             return Some(rest);
