@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { getPairing, type PairingRecord } from "../lib/storage/idb";
 import { connectPty, type PtyConnection } from "../lib/pty-ws";
@@ -17,7 +18,6 @@ export default function Terminal() {
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [retryNonce, setRetryNonce] = useState(0);
   const [debugLog, setDebugLog] = useState<string[]>([]);
-  // Stable ref for accumulating logs without triggering re-renders for every line.
   const debugLogRef = useRef<string[]>([]);
   const appendDebug = (msg: string) => {
     const stamped = `[${new Date().toISOString().slice(11, 19)}] ${msg}`;
@@ -50,16 +50,32 @@ export default function Terminal() {
       }
 
       if (!containerRef.current || cancelled) return;
+      const isMobile =
+        typeof navigator !== "undefined" &&
+        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
       xterm = new XTerm({
         cursorBlink: true,
         fontFamily:
           'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
-        fontSize: 13,
+        fontSize: isMobile ? 12 : 13,
+        scrollback: 5000,
+        smoothScrollDuration: 0,
+        fastScrollSensitivity: 5,
+        scrollSensitivity: 3,
+        allowTransparency: true,
         theme: { background: "#0a0a0a" },
       });
       fit = new FitAddon();
       xterm.loadAddon(fit);
       xterm.open(containerRef.current);
+      // WebGL for smooth GPU-accelerated rendering on mobile.
+      try {
+        const wgl = new WebglAddon();
+        xterm.loadAddon(wgl);
+        wgl.onContextLoss(() => wgl.dispose());
+      } catch {
+        /* WebGL not available */
+      }
       try {
         fit.fit();
       } catch {
@@ -96,24 +112,25 @@ export default function Terminal() {
         });
       });
 
+      // Buffer output until the initial size-control frame lands.
+      // Without this, bytes render at default 80×24, then xterm.resize
+      // shifts positions and old content ghost-renders on mobile.
+      let sized = false;
+      const outputBuf: Uint8Array[] = [];
+      const flushOutput = () => {
+        for (const chunk of outputBuf.splice(0)) {
+          xterm!.write(chunk);
+        }
+      };
       connection.onOutput((bytes) => {
-        if (xterm) xterm.write(bytes);
+        if (!xterm) return;
+        if (!sized) {
+          outputBuf.push(bytes);
+        } else {
+          xterm.write(bytes);
+        }
       });
 
-      // Daemon sends a `{type:"size", rows, cols}` Control frame on attach
-      // with the laptop pane's actual size. Two cases:
-      //
-      // 1. Browser/wide client (fit-derived size >= laptop): match the
-      //    laptop. xterm.resize(laptop_cols, laptop_rows). Bytes flow at
-      //    laptop's coords and render correctly. NO upstream resize, so
-      //    laptop user sees no change. (This is what fixed the desktop
-      //    browser duplicate-render bug.)
-      //
-      // 2. Phone/narrow client (fit-derived size < laptop): the laptop's
-      //    cursor positioning would clamp on phone's smaller grid and pile
-      //    up. Instead, tell the laptop to shrink to phone's fit-size; the
-      //    laptop's TUI re-flows for the narrow viewport via SIGWINCH and
-      //    bytes flow at phone size — no clamping, readable text.
       connection.onControl((payload) => {
         if (
           !xterm ||
@@ -128,30 +145,23 @@ export default function Terminal() {
         const laptopCols = typeof p.cols === "number" ? p.cols : 0;
         if (laptopRows <= 0 || laptopCols <= 0) return;
 
-        // Phone's natural size is whatever fit.fit() set after open(). If
-        // the phone is at least as large as the laptop, match the laptop;
-        // otherwise drive the laptop down to phone size.
+        // First size frame — flush buffered output now that dimensions
+        // are known, so the parser renders at the correct size.
+        if (!sized) {
+          sized = true;
+          flushOutput();
+        }
+
         const phoneRows = xterm.rows;
         const phoneCols = xterm.cols;
         appendDebug(
           `size msg laptop=${laptopRows}x${laptopCols} phone=${phoneRows}x${phoneCols}`,
         );
 
-        // Threshold: only trigger an upstream laptop-resize when the phone
-        // is genuinely too narrow for a normal TUI to fit (< 80 cols, the
-        // canonical terminal width). Above 80 cols we always match the
-        // laptop's size — desktop browsers, even at narrower window
-        // widths, end up here and the laptop user sees no change.
-        // iPhone Safari at default viewport falls below 80 cols and gets
-        // the laptop shrunk to its own size so claude code re-flows.
         const TOO_NARROW = 80;
         if (phoneCols >= TOO_NARROW) {
-          // Wide enough — match laptop, no upstream resize. (Browser case.)
           xterm.resize(laptopCols, laptopRows);
         } else if (connection) {
-          // iPhone-like — keep our own (smaller) size and ask the laptop
-          // to shrink. Laptop's TUI re-flows for the narrow viewport via
-          // SIGWINCH; new bytes will arrive at phone size.
           appendDebug(`request laptop shrink to ${phoneRows}x${phoneCols} (phone < 80 cols)`);
           void connection
             .sendControl({ type: "resize", rows: phoneRows, cols: phoneCols })
@@ -163,16 +173,21 @@ export default function Terminal() {
         if (cancelled) return;
         setErrorMsg(`Connection closed (${info.code}${info.reason ? `: ${info.reason}` : ""})`);
         setStatus("disconnected");
-        // v0.4-thin Stage C: when the close looks like the session went away
-        // (1006 abnormal-close — host-side pump aborted; or 1011 server
-        // error), check whether the session still exists. If not, the user
-        // is stranded on a dead Terminal page whose Retry button would 404 —
-        // navigate them back to the Sessions list instead.
+        // Auto-reconnect on transient close (app switch, DERP flap, idle timeout).
+        // Normal codes (1000, 1001) mean intentional close — don't auto-retry.
+        if (
+          info.code !== 1000 &&
+          info.code !== 1001 &&
+          !cancelled
+        ) {
+          const delay = info.code === 1006 ? 1500 : 3000;
+          setTimeout(() => {
+            if (!cancelled) setRetryNonce((n) => n + 1);
+          }, delay);
+        }
         if (
           info.code === 1006 ||
           info.code === 1011 ||
-          // 4500 is the daemon's own "pty_io" close code from
-          // `crates/omw-remote/src/ws/pty.rs`; same idea: session is gone.
           info.code === 4500
         ) {
           void listSessions(pairing!)
@@ -188,8 +203,7 @@ export default function Terminal() {
               }
             })
             .catch(() => {
-              // listSessions failure (e.g. host unreachable) — leave the
-              // user on the disconnected screen with the Retry option.
+              /* host unreachable — stay on disconnected screen */
             });
         }
       });
@@ -262,16 +276,16 @@ export default function Terminal() {
       <div
         ref={containerRef}
         data-testid="xterm-container"
-        className="h-[70vh] rounded border border-neutral-800 bg-black p-2"
+        className="rounded border border-neutral-800 bg-black p-2"
+        style={{
+          height: "min(75vh, 100dvh - 180px)",
+          touchAction: "none",
+          overscrollBehavior: "contain",
+          WebkitUserSelect: "none",
+          userSelect: "none",
+        }}
       />
 
-      {/* On-device debug log — primary purpose is to surface WebSocket
-          lifecycle events on iOS Safari where DevTools isn't accessible.
-          Renders the most recent ~30 events from connectPty / WS / signature
-          verification / etc. Hidden once the connection is healthy and an
-          output frame has flowed (status === "connected" and the log shows
-          a "connectPty resolved" line). For now we render unconditionally so
-          we can diagnose stuck-connecting cases. */}
       {debugLog.length > 0 ? (
         <details
           open={status !== "connected"}

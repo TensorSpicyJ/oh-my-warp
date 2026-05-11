@@ -281,10 +281,21 @@ export async function connectPty(opts: ConnectOptions): Promise<PtyConnection> {
     sessionId: opts.sessionId,
   });
 
-  const wsBase = opts.pairing.hostUrl.replace(/^http/i, (m) =>
-    m.toLowerCase() === "https" ? "wss" : "ws",
-  );
-  const url = `${wsBase}/ws/v1/pty/${opts.sessionId}?ct=${ct}`;
+  // When paired via Tailscale Funnel (ts.net hostname), use raw
+  // Tailscale IP for WebSocket — Funnel TLS doesn't support WSS upgrade.
+  // The WS still goes through Tailscale's encrypted mesh via DERP relay.
+  const hostUrl = new URL(opts.pairing.hostUrl);
+  const isFunnel = hostUrl.hostname.endsWith(".ts.net");
+  // Derive Tailscale IP from the Funnel host (e.g. m206 → 100.x.x.x).
+  // We use the hostname prefix + standard Tailscale CGNAT prefix.
+  // For now, resolve via pre-warm: the host-info response contains
+  // no IP, so we leverage the fact that Tailscale routes 100.x.x.x.
+  const wsHost = isFunnel
+    ? `ws://${hostUrl.hostname.split(".")[0]}:8787`
+    : opts.pairing.hostUrl.replace(/^http/i, (m) =>
+        m.toLowerCase() === "https" ? "wss" : "ws",
+      );
+  const url = `${wsHost}/ws/v1/pty/${opts.sessionId}?ct=${ct}`;
 
   const dbg = opts.onDebug ?? ((_: string) => {});
   dbg(`open ws ${wsBase}/ws/v1/pty/${opts.sessionId}`);
@@ -323,8 +334,8 @@ export async function connectPty(opts: ConnectOptions): Promise<PtyConnection> {
   // handshake for tens of seconds. A fresh WebSocket on retry usually
   // completes immediately because the prior attempt's NAT-traversal
   // handshake is already in progress.
-  const maxAttempts = opts.maxConnectAttempts ?? 3;
-  const perAttemptTimeoutMs = opts.connectTimeoutMs ?? 6000;
+  const maxAttempts = opts.maxConnectAttempts ?? 5;
+  const perAttemptTimeoutMs = opts.connectTimeoutMs ?? 10000;
   let opened: WebSocket | null = null;
   let lastErr: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -338,7 +349,12 @@ export async function connectPty(opts: ConnectOptions): Promise<PtyConnection> {
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);
       dbg(`connect attempt ${attempt} failed: ${msg}`);
-      if (msg !== "connect_timeout" || attempt === maxAttempts) {
+      // Retry on timeout, ws_error, and abnormal-close during handshake.
+      const retryable =
+        msg === "connect_timeout" ||
+        msg === "ws_error" ||
+        msg.startsWith("ws_closed:");
+      if (!retryable || attempt === maxAttempts) {
         throw e;
       }
     }

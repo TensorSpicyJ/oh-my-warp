@@ -245,42 +245,21 @@ pub async fn share_pane(
     // otherwise see receiver_count == 0 and drop the chunk).
     let mut pty_rx = pty_reads_tx.new_receiver();
 
-    // SIGWINCH trick (mirror of `2a61ae5`'s "fix at the source" pattern):
-    // before the pump starts, push a one-row jitter through `event_loop_tx`.
-    // Two `Message::Resize` events deliver SIGWINCH to the laptop pane's
-    // child process; ratatui apps (which is what Claude Code uses) respond
-    // by re-emitting their entire viewport via the normal byte stream.
-    // Those bytes flow back through `pty_reads_tx` and are caught by the
-    // pump we're about to spawn — so the parser gets a complete baseline
-    // frame instead of just the incremental sync-update deltas Claude
-    // sends per spinner tick / hint refresh.
-    //
-    // Without this, the phone xterm starts from an empty grid and the
-    // child's deltas accumulate visibly: the "/exit hint stays on screen"
-    // and "spinner states pile up" symptoms reported during smoke testing.
+    // Warm the parser with a size-at-rest resize so the phone xterm
+    // starts from a known baseline without duplicate-render ghosting.
+    // The old SIGWINCH jitter (shrink-then-restore) was removed — it
+    // caused visible glitching on the laptop pane while the phone was
+    // attaching.
     {
-        let jitter_size = current_size.with_rows_and_columns(
-            current_size.rows().saturating_sub(1).max(1),
-            current_size.columns(),
-        );
         eprintln!(
-            "[omw-debug] pane_share[{pane_name_log}] SIGWINCH trick: resize {}x{} -> {}x{} -> {}x{}",
-            current_size.rows(),
-            current_size.columns(),
-            jitter_size.rows(),
-            jitter_size.columns(),
+            "[omw-debug] pane_share[{pane_name_log}] parser warm: resize {}x{}",
             current_size.rows(),
             current_size.columns(),
         );
         let tx = event_loop_tx.lock();
-        if let Err(e) = tx.send(Message::Resize(jitter_size)) {
-            eprintln!(
-                "[omw-debug] pane_share[{pane_name_log}] SIGWINCH trick: jitter resize FAILED: {e:?}"
-            );
-        }
         if let Err(e) = tx.send(Message::Resize(current_size)) {
             eprintln!(
-                "[omw-debug] pane_share[{pane_name_log}] SIGWINCH trick: restore resize FAILED: {e:?}"
+                "[omw-debug] pane_share[{pane_name_log}] parser warm resize FAILED: {e:?}"
             );
         }
     }
